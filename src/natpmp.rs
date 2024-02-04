@@ -242,6 +242,7 @@ pub async fn try_port_mapping(
 }
 
 /// Attempts to remove a NAT-PMP mapping on the gateway.
+/// Using a local port of `0` will remove all port mappings for our client with the given protocol.
 /// # Errors
 /// Returns a `natpmp::Failure` enum which decomposes into errors related to
 /// the UDP socket, the gateway not responding, or the gateway giving an invalid response.
@@ -259,6 +260,7 @@ pub async fn try_drop_mapping(
         ..
     } = try_port_mapping(gateway, protocol, local_port, Some(0), Some(0)).await?;
 
+    // Check that the response is correct for a deletion request.
     if internal_port != local_port || external_port != 0 || !lifetime.is_zero() {
         return Err(Failure::InvalidResponse(format!(
             "Invalid response to deletion request: {internal_port} {external_port} {lifetime:?}"

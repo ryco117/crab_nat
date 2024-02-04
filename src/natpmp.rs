@@ -6,7 +6,7 @@ use std::{
 use bytes::{Buf, BufMut};
 use num_enum::TryFromPrimitive;
 
-use crate::{helpers, MappingProtocol, PortMapping, VersionIdentifier, SANE_MAX_DATAGRAM_SIZE};
+use crate::{helpers, InternetProtocol, PortMapping, Version, SANE_MAX_DATAGRAM_SIZE};
 
 /// The RFC recommended lifetime for a port mapping.
 pub const RECOMMENDED_MAPPING_LIFETIME_SECONDS: u32 = 7200;
@@ -74,10 +74,7 @@ pub async fn try_external_address(gateway: IpAddr) -> Result<Ipv4Addr, Failure> 
 
     // Get external address.
     socket
-        .send(&[
-            VersionIdentifier::NatPmp as u8,
-            OperationCode::ExternalAddress as u8,
-        ])
+        .send(&[Version::NatPmp as u8, OperationCode::ExternalAddress as u8])
         .await
         .map_err(Failure::Socket)?;
 
@@ -100,11 +97,11 @@ pub async fn try_external_address(gateway: IpAddr) -> Result<Ipv4Addr, Failure> 
     }
 
     // Read and verify the version and operation bytes.
-    let v = VersionIdentifier::try_from(reader.get_u8())
+    let v = Version::try_from(reader.get_u8())
         .map_err(|v| Failure::InvalidResponse(format!("Invalid version: {v:#}")))?;
     let op = OperationCode::try_from(response_to_opcode(reader.get_u8()))
         .map_err(|o| Failure::InvalidResponse(format!("Invalid operation code: {o:#}")))?;
-    if v != VersionIdentifier::NatPmp {
+    if v != Version::NatPmp {
         return Err(Failure::InvalidResponse(format!(
             "Unsupported version: {v:?}"
         )));
@@ -146,7 +143,7 @@ pub async fn try_external_address(gateway: IpAddr) -> Result<Ipv4Addr, Failure> 
 /// Returns a `natpmp::Failure` enum which decomposes into the following errors:
 pub async fn try_port_mapping(
     gateway: IpAddr,
-    protocol: MappingProtocol,
+    protocol: InternetProtocol,
     internal_port: u16,
     external_port: Option<u16>,
 ) -> Result<PortMapping, Failure> {
@@ -156,13 +153,13 @@ pub async fn try_port_mapping(
 
     // Determine the operation code based on the protocol to map.
     let req_op = match protocol {
-        MappingProtocol::Udp => OperationCode::MapUdp,
-        MappingProtocol::Tcp => OperationCode::MapTcp,
+        InternetProtocol::Udp => OperationCode::MapUdp,
+        InternetProtocol::Tcp => OperationCode::MapTcp,
     };
 
     // Format the port mapping request.
     let mut bb = bytes::BytesMut::with_capacity(SANE_MAX_DATAGRAM_SIZE);
-    bb.put_u8(VersionIdentifier::NatPmp as u8);
+    bb.put_u8(Version::NatPmp as u8);
     bb.put_u8(req_op as u8);
     bb.put_u16(0); // Reserved.
     bb.put_u16(internal_port);
@@ -192,18 +189,18 @@ pub async fn try_port_mapping(
     }
 
     // Read and verify the version and operation bytes.
-    let v = VersionIdentifier::try_from(bb.get_u8())
+    let v = Version::try_from(bb.get_u8())
         .map_err(|v| Failure::InvalidResponse(format!("Invalid version: {v:#}")))?;
     let op = OperationCode::try_from(response_to_opcode(bb.get_u8()))
         .map_err(|o| Failure::InvalidResponse(format!("Invalid operation code: {o:#}")))?;
-    if v != VersionIdentifier::NatPmp {
+    if v != Version::NatPmp {
         return Err(Failure::InvalidResponse(format!(
             "Unsupported version: {v:?}"
         )));
     }
     let protocol = match (op, op == req_op) {
-        (OperationCode::MapUdp, true) => MappingProtocol::Udp,
-        (OperationCode::MapTcp, true) => MappingProtocol::Tcp,
+        (OperationCode::MapUdp, true) => InternetProtocol::Udp,
+        (OperationCode::MapTcp, true) => InternetProtocol::Tcp,
         _ => {
             return Err(Failure::InvalidResponse(format!(
                 "Incorrect opcode: {op:?}"
@@ -233,6 +230,7 @@ pub async fn try_port_mapping(
         internal_port,
         external_port,
         lifetime,
+        version: v,
     })
 }
 

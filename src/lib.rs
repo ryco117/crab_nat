@@ -8,7 +8,7 @@ pub mod pcp;
 /// 8-bit version field in the NAT-PMP and PCP headers.
 #[derive(Debug, PartialEq, TryFromPrimitive)]
 #[repr(u8)]
-pub enum VersionIdentifier {
+pub enum Version {
     /// NAT-PMP identifies its version with a `0` byte.
     NatPmp = 0,
 
@@ -21,17 +21,19 @@ pub enum VersionIdentifier {
 /// Specifies the protocol to map a port for.
 #[repr(u8)]
 #[derive(Debug)]
-pub enum MappingProtocol {
+pub enum InternetProtocol {
     Udp = 1,
     Tcp,
 }
 
+/// A port mapping on the gateway.
 pub struct PortMapping {
     pub gateway: IpAddr,
-    pub protocol: MappingProtocol,
+    pub protocol: InternetProtocol,
     pub internal_port: u16,
     pub external_port: u16,
     pub lifetime: Duration,
+    pub version: Version,
 }
 
 /// The protocols do not require a large datagram size.
@@ -50,7 +52,7 @@ pub const ICMP_PORT_UNREACHABLE: &str = "ICMP Port Unreachable";
 /// Will try to use the given external port if it is `Some`, otherwise it will let the gateway choose.
 pub async fn try_port_mapping(
     gateway: IpAddr,
-    protocol: MappingProtocol,
+    protocol: InternetProtocol,
     internal_port: u16,
     external_port: Option<u16>,
 ) -> anyhow::Result<PortMapping> {

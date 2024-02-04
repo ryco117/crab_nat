@@ -38,10 +38,11 @@ async fn main() {
         internal_port,
         external_port,
         lifetime,
+        version,
         ..
     } = match crab_nat::try_port_mapping(
         gateway,
-        crab_nat::MappingProtocol::Tcp,
+        crab_nat::InternetProtocol::Tcp,
         args.internal_port,
         args.external_port,
     )
@@ -52,5 +53,5 @@ async fn main() {
     };
 
     // Print the mapped port information.
-    println!("Success!\nMapped protocol {protocol:?} on external port {external_port} to internal port {internal_port} with a lifetime of {lifetime:?}");
+    println!("Success!\nMapped protocol {protocol:?} on external port {external_port} to internal port {internal_port} with a lifetime of {lifetime:?} using version {version:?}");
 }

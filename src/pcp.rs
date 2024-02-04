@@ -16,3 +16,5 @@ pub enum ResultCode {
     AddressMismatch,
     ExcessiveRemotePeers,
 }
+
+// starts at https://www.rfc-editor.org/rfc/rfc6887#section-7

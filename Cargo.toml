@@ -1,0 +1,21 @@
+[package]
+name = "crab_nat"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+anyhow = "1.0.79"
+bytes = "1.5.0"
+displaydoc = "0.2.4"
+num_enum = "0.7.2"
+thiserror = "1.0.56"
+tokio = { version = "1.36.0", features = ["full"] }
+
+[dev-dependencies]
+clap = { version = "4.4.18", features = ["derive"] }
+default-net = "0.21.0"
+
+[[example]]
+name = "client"

@@ -1,5 +1,8 @@
 #[derive(clap::Parser)]
 struct Cli {
+    #[arg(short, long, default_value_t = false)]
+    delete: bool,
+
     #[arg(short, long, default_value = "")]
     gateway: String,
 
@@ -32,26 +35,42 @@ async fn main() {
     };
     println!("External IP: {external_ip:#}");
 
-    // Attempt a port mapping request.
-    let crab_nat::PortMapping {
-        protocol,
-        internal_port,
-        external_port,
-        lifetime,
-        version,
-        ..
-    } = match crab_nat::try_port_mapping(
-        gateway,
-        crab_nat::InternetProtocol::Tcp,
-        args.internal_port,
-        args.external_port,
-    )
-    .await
-    {
-        Ok(m) => m,
-        Err(e) => return eprintln!("Failed to map port: {e:#}"),
-    };
+    if args.delete {
+        // Attempt a port unmapping request.
+        if let Err(e) = crab_nat::natpmp::try_drop_mapping(
+            gateway,
+            crab_nat::InternetProtocol::Tcp,
+            args.internal_port,
+        )
+        .await
+        {
+            return eprintln!("Failed to unmap port: {e:#}");
+        }
 
-    // Print the mapped port information.
-    println!("Success!\nMapped protocol {protocol:?} on external port {external_port} to internal port {internal_port} with a lifetime of {lifetime:?} using version {version:?}");
+        // Print the mapped port information.
+        println!("Success! Deleted previous port mapping");
+    } else {
+        // Attempt a port mapping request.
+        let crab_nat::PortMapping {
+            protocol,
+            internal_port,
+            external_port,
+            lifetime,
+            version,
+            ..
+        } = match crab_nat::try_port_mapping(
+            gateway,
+            crab_nat::InternetProtocol::Tcp,
+            args.internal_port,
+            args.external_port,
+        )
+        .await
+        {
+            Ok(m) => m,
+            Err(e) => return eprintln!("Failed to map port: {e:#}"),
+        };
+
+        // Print the mapped port information.
+        println!("Success!\nMapped protocol {protocol:?} on external port {external_port} to internal port {internal_port} with a lifetime of {lifetime:?} using version {version:?}");
+    }
 }

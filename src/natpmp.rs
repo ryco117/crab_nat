@@ -18,14 +18,19 @@ pub const RECOMMENDED_MAPPING_LIFETIME_SECONDS: u32 = 7200;
 pub enum ResultCode {
     /// Success. Will not be returned as an error.
     Success,
+
     /// The server does not support this version of the protocol.
     UnsupportedVersion,
-    /// The server did not grant us permission to perform the operation.
+
+    /// The server did not authorize the operation.
     NotAuthorized,
+
     /// The server is not in a valid network state to perform the operation.
     NetworkFailure,
+
     /// The server is lacking resources, such as open ports, to complete the operation.
     OutOfResources,
+
     /// The server does not support the requested operation.
     UnsupportedOpcode,
 }
@@ -137,15 +142,17 @@ pub async fn try_external_address(gateway: IpAddr) -> Result<Ipv4Addr, Failure> 
     Ok(external_ip)
 }
 
-/// Attempts to map a port on the gateway using NAT-PMP or PCP.
+/// Attempts to map a port on the gateway using NAT-PMP.
 /// Will try to use the given external port if it is `Some`, otherwise it will let the gateway choose.
+/// Will request the specified lifetime if it is `Some`, otherwise it will use the RFC recommended lifetime.
 /// # Errors
-/// Returns a `natpmp::Failure` enum which decomposes into the following errors:
+/// Returns a `natpmp::Failure` enum which decomposes into errors related to the UDP socket, the gateway not responding, or the gateway giving an invalid response.
 pub async fn try_port_mapping(
     gateway: IpAddr,
     protocol: InternetProtocol,
     internal_port: u16,
     external_port: Option<u16>,
+    lifetime_seconds: Option<u32>,
 ) -> Result<PortMapping, Failure> {
     let socket = helpers::new_socket(gateway)
         .await
@@ -164,7 +171,7 @@ pub async fn try_port_mapping(
     bb.put_u16(0); // Reserved.
     bb.put_u16(internal_port);
     bb.put_u16(external_port.unwrap_or_default());
-    bb.put_u32(RECOMMENDED_MAPPING_LIFETIME_SECONDS);
+    bb.put_u32(lifetime_seconds.unwrap_or(RECOMMENDED_MAPPING_LIFETIME_SECONDS));
 
     // Send the request.
     socket.send(&bb).await.map_err(Failure::Socket)?;
@@ -181,7 +188,7 @@ pub async fn try_port_mapping(
     .map_err(|_| Failure::Timeout(()))?
     .map_err(Failure::Socket)?;
 
-    // A port mapping response is always expected to be 12 bytes.
+    // A port mapping response is always expected to be 16 bytes.
     if n != 16 {
         return Err(Failure::InvalidResponse(format!(
             "Incorrect number of bytes: {n}"
@@ -232,6 +239,33 @@ pub async fn try_port_mapping(
         lifetime,
         version: v,
     })
+}
+
+/// Attempts to remove a NAT-PMP mapping on the gateway.
+/// # Errors
+/// Returns a `natpmp::Failure` enum which decomposes into errors related to
+/// the UDP socket, the gateway not responding, or the gateway giving an invalid response.
+pub async fn try_drop_mapping(
+    gateway: IpAddr,
+    protocol: InternetProtocol,
+    local_port: u16,
+) -> Result<(), Failure> {
+    // Mapping deletion is specified by the same operation code and format as mapping creation.
+    // The difference is that the lifetime and external port must be set to `0`.
+    let PortMapping {
+        internal_port,
+        external_port,
+        lifetime,
+        ..
+    } = try_port_mapping(gateway, protocol, local_port, Some(0), Some(0)).await?;
+
+    if internal_port != local_port || external_port != 0 || !lifetime.is_zero() {
+        return Err(Failure::InvalidResponse(format!(
+            "Invalid response to deletion request: {internal_port} {external_port} {lifetime:?}"
+        )));
+    }
+
+    Ok(())
 }
 
 /// Response `OpCodes` are the same as the request `OpCodes`, but with the 128 bit set.

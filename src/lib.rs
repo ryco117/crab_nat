@@ -37,7 +37,7 @@ pub struct PortMapping {
 }
 
 /// The protocols do not require a large datagram size.
-pub const SANE_MAX_DATAGRAM_SIZE: usize = 512;
+pub const SANE_MAX_DATAGRAM_SIZE: usize = 256;
 
 /// The required port for NAT-PMP and its successor, PCP.
 pub const GATEWAY_PORT: u16 = 5351;
@@ -45,18 +45,17 @@ pub const GATEWAY_PORT: u16 = 5351;
 /// The RFC states that the first response timeout SHOULD be 250 milliseconds, and double on each successive failure.
 pub const FIRST_TIMEOUT_MILLIS: u64 = 250;
 
-/// If the server resonds with this message then it does not support NAT-PMP or PCP.
-pub const ICMP_PORT_UNREACHABLE: &str = "ICMP Port Unreachable";
-
-/// Attempts to map a port on the gateway using NAT-PMP or PCP.
+/// Attempts to map a port on the gateway using NAT-PMP.
 /// Will try to use the given external port if it is `Some`, otherwise it will let the gateway choose.
+/// # Errors
+/// May fail from issues encountered by the UDP socket, the gateway not responding, or the gateway giving an invalid response.
 pub async fn try_port_mapping(
     gateway: IpAddr,
     protocol: InternetProtocol,
     internal_port: u16,
     external_port: Option<u16>,
 ) -> anyhow::Result<PortMapping> {
-    natpmp::try_port_mapping(gateway, protocol, internal_port, external_port)
+    natpmp::try_port_mapping(gateway, protocol, internal_port, external_port, None)
         .await
         .map_err(std::convert::Into::into)
 }

@@ -7,12 +7,16 @@ use bytes::{Buf, BufMut};
 use num_enum::TryFromPrimitive;
 use tokio::net::UdpSocket;
 
-use crate::{
-    helpers, InternetProtocol, PortMapping, Version, FIRST_TIMEOUT_MILLIS, SANE_MAX_DATAGRAM_SIZE,
-};
+use crate::{helpers, InternetProtocol, PortMapping, Version};
 
 /// The RFC recommended lifetime for a port mapping.
 pub const RECOMMENDED_MAPPING_LIFETIME_SECONDS: u32 = 7200;
+
+/// The RFC states that the first response timeout SHOULD be 250 milliseconds, and double on each successive failure.
+pub const FIRST_TIMEOUT_MILLIS: u64 = 250;
+
+/// NAT-PMP does not require datagrams larger than 16 bytes.
+pub const MAX_DATAGRAM_SIZE: usize = 16;
 
 /// Result codes from a NAT-PMP response.
 /// See <https://www.rfc-editor.org/rfc/rfc6886#section-3.5>
@@ -85,10 +89,10 @@ pub async fn try_external_address(gateway: IpAddr) -> Result<Ipv4Addr, Failure> 
         .map_err(Failure::Socket)?;
 
     // Use a byte-buffer to read the response into.
-    let mut reader = bytes::BytesMut::with_capacity(SANE_MAX_DATAGRAM_SIZE);
+    let mut reader = bytes::BytesMut::with_capacity(MAX_DATAGRAM_SIZE);
     // Try to send the request data until a response is read, respecting the RFC recommended timeouts and retries counts.
     let n = try_send_until_response(
-        crate::SANE_MAX_RETRIES,
+        crate::SANE_MAX_REQUEST_RETRIES,
         &socket,
         &[Version::NatPmp as u8, OperationCode::ExternalAddress as u8],
         &mut reader,
@@ -105,7 +109,7 @@ pub async fn try_external_address(gateway: IpAddr) -> Result<Ipv4Addr, Failure> 
     // Read and verify the version and operation bytes.
     let v = Version::try_from(reader.get_u8())
         .map_err(|v| Failure::InvalidResponse(format!("Invalid version: {v:#}")))?;
-    let op = OperationCode::try_from(response_to_opcode(reader.get_u8()))
+    let op = response_to_opcode(reader.get_u8())
         .map_err(|o| Failure::InvalidResponse(format!("Invalid operation code: {o:#}")))?;
     if v != Version::NatPmp {
         return Err(Failure::InvalidResponse(format!(
@@ -169,8 +173,10 @@ pub async fn try_port_mapping(
         InternetProtocol::Tcp => OperationCode::MapTcp,
     };
 
+    // Create a byte-buffer with enough space for the request and response bytes.
+    let mut bb = bytes::BytesMut::with_capacity(MAX_DATAGRAM_SIZE << 1);
+
     // Format the port mapping request.
-    let mut bb = bytes::BytesMut::with_capacity(SANE_MAX_DATAGRAM_SIZE << 1);
     bb.put_u8(Version::NatPmp as u8);
     bb.put_u8(req_op as u8);
     bb.put_u16(0); // Reserved.
@@ -182,7 +188,8 @@ pub async fn try_port_mapping(
     let send_buf = bb.split();
 
     // Try to send the request data until a response is read, respecting the RFC recommended timeouts and retries counts.
-    let n = try_send_until_response(crate::SANE_MAX_RETRIES, &socket, &send_buf, &mut bb).await?;
+    let n = try_send_until_response(crate::SANE_MAX_REQUEST_RETRIES, &socket, &send_buf, &mut bb)
+        .await?;
 
     // A port mapping response is always expected to be 16 bytes.
     if n != 16 {
@@ -194,7 +201,7 @@ pub async fn try_port_mapping(
     // Read and verify the version and operation bytes.
     let v = Version::try_from(bb.get_u8())
         .map_err(|v| Failure::InvalidResponse(format!("Invalid version: {v:#}")))?;
-    let op = OperationCode::try_from(response_to_opcode(bb.get_u8()))
+    let op = response_to_opcode(bb.get_u8())
         .map_err(|o| Failure::InvalidResponse(format!("Invalid operation code: {o:#}")))?;
     if v != Version::NatPmp {
         return Err(Failure::InvalidResponse(format!(
@@ -281,7 +288,7 @@ pub async fn try_send_until_response(
     send_bytes: &[u8],
     recv_buf: &mut bytes::BytesMut,
 ) -> Result<usize, Failure> {
-    // Create an internal helper to easily try sending and recieving packets, and springboard errors back to the caller.
+    // Create an internal helper to easily try sending and receiving packets, and springboard errors back to the caller.
     async fn send_and_recv(
         socket: &UdpSocket,
         send_bytes: &[u8],
@@ -312,7 +319,7 @@ pub async fn try_send_until_response(
                 retries += 1;
 
                 // Follow RFC recommendation to double the timeout on each successive failure.
-                wait *= 2;
+                wait += wait;
 
                 #[cfg(debug_assertions)]
                 println!("Retrying with timeout {wait:?}: {retries}/{max_retries} retries");
@@ -324,8 +331,10 @@ pub async fn try_send_until_response(
     }
 }
 
-/// Response `OpCodes` are the same as the request `OpCodes`, but with the 128 bit set.
+/// Response `OperationCode`s are the same as the request `OperationCode`s, but with the 128 bit set.
 /// This function subtracts the `128` from the response code and returns the result.
-fn response_to_opcode(op: u8) -> u8 {
-    op - 128
+fn response_to_opcode(
+    op: u8,
+) -> Result<OperationCode, num_enum::TryFromPrimitiveError<OperationCode>> {
+    OperationCode::try_from(op - 128)
 }

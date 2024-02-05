@@ -36,17 +36,11 @@ pub struct PortMapping {
     pub version: Version,
 }
 
-/// The protocols do not require a large datagram size.
-pub const SANE_MAX_DATAGRAM_SIZE: usize = 128;
-
-// The RFC states that connections SHOULD retry up to 8 times, but we will only retry 4 times.
-const SANE_MAX_RETRIES: usize = 4;
+// The RFC states that connections SHOULD make up to 9 attempts <https://www.rfc-editor.org/rfc/rfc6886#section-3.1>, but we will only make 4 attempts.
+const SANE_MAX_REQUEST_RETRIES: usize = 3;
 
 /// The required port for NAT-PMP and its successor, PCP.
 pub const GATEWAY_PORT: u16 = 5351;
-
-/// The RFC states that the first response timeout SHOULD be 250 milliseconds, and double on each successive failure.
-pub const FIRST_TIMEOUT_MILLIS: u64 = 250;
 
 /// Attempts to map a port on the gateway using NAT-PMP.
 /// Will try to use the given external port if it is `Some`, otherwise it will let the gateway choose.

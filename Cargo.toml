@@ -1,9 +1,9 @@
 [package]
 name = "crab_nat"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 authors = ["Ryan Andersen <ryco117@gmail.com>"]
-description = "A pure Rust library implementation of a client for both the NAT Port Mapping Protocol (NAT-PMP) and the Port Control Protocol (PCP)."
+description = "A library providing a pure Rust implementation of a client for both the NAT Port Mapping Protocol (NAT-PMP) and the Port Control Protocol (PCP)."
 license = "MIT"
 repository = "https://github.com/ryco117/crab_nat"
 

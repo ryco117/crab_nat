@@ -8,33 +8,49 @@
 //! ```rust,no_run
 //! async {
 //!     // Attempt a port mapping request through PCP first and fallback to NAT-PMP.
-//!     let mapping = match crab_nat::try_port_mapping(
-//!         std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 1)) /* address of the PCP server, often a gateway or firewall */,
-//!         std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 167)) /* address of our client, as seen by the gateway. Only used by PCP */,
-//!         crab_nat::InternetProtocol::Tcp,
-//!         8080 /* internal port */,
-//!         None /* external port, no preference */,
-//!         None /* lifetime, use default of 2 hours */,
+//!     let mapping = match crab_nat::PortMapping::new(
+//!         std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 1)) /* Address of the PCP server, often a gateway or firewall */,
+//!         std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 167)) /* Address of our client, as seen by the gateway. Only used by PCP */,
+//!         crab_nat::InternetProtocol::Tcp /* Protocol to map */,
+//!         std::num::NonZeroU16::new(8080).unwrap() /* Internal port, cannot be zero */,
+//!         None /* External port, no preference */,
+//!         None /* Lifetime, use default of 2 hours */,
 //!     )
 //!     .await
 //!     {
 //!         Ok(m) => m,
 //!         Err(e) => return eprintln!("Failed to map port: {e:?}"),
 //!     };
+//!
+//!     // ...
+//!
+//!     // Try to safely drop the mapping.
+//!     if let Err((e, m)) = mapping.try_drop().await {
+//!         eprintln!("Failed to drop mapping {}:{}->{}: {e:?}", m.gateway(), m.external_port(), m.internal_port());
+//!     } else {
+//!         println!("Successfully deleted the mapping...");
+//!     }
 //! };
 //! ```
 
-use std::{net::IpAddr, time::Duration};
+use std::net::IpAddr;
 
 use num_enum::TryFromPrimitive;
 
 pub mod natpmp;
 pub mod pcp;
 
+// The RFC states that connections SHOULD make up to 9 attempts <https://www.rfc-editor.org/rfc/rfc6886#section-3.1>
+// However, that would be largely impractical so we only make 4 attempts.
+const SANE_MAX_REQUEST_RETRIES: usize = 3;
+
+/// The required port for NAT-PMP and its successor, PCP.
+pub const GATEWAY_PORT: u16 = 5351;
+
 /// 8-bit version field in the NAT-PMP and PCP headers.
 #[derive(Debug, PartialEq, TryFromPrimitive)]
 #[repr(u8)]
-pub enum Version {
+pub enum VersionCode {
     /// NAT-PMP identifies its version with a `0` byte.
     NatPmp = 0,
 
@@ -52,57 +68,155 @@ pub enum InternetProtocol {
     Tcp,
 }
 
-/// A port mapping on the gateway.
-pub struct PortMapping {
-    pub gateway: IpAddr,
-    pub protocol: InternetProtocol,
-    pub internal_port: u16,
-    pub external_port: u16,
-    pub lifetime: Duration,
-    pub version: Version,
+/// Specifies a port mapping protocol, as well as any protocol specific parameters.
+#[derive(Clone, Copy, Debug)]
+pub enum PortMappingType {
+    NatPmp,
+    Pcp { client: IpAddr },
 }
 
-// The RFC states that connections SHOULD make up to 9 attempts <https://www.rfc-editor.org/rfc/rfc6886#section-3.1>, but we will only make 4 attempts.
-const SANE_MAX_REQUEST_RETRIES: usize = 3;
-
-/// The required port for NAT-PMP and its successor, PCP.
-pub const GATEWAY_PORT: u16 = 5351;
-
-/// Attempts to map a port on the gateway using PCP first and falling back to NAT-PMP.
-/// Will request to use a given external port if specified, otherwise it will let the gateway choose.
-/// If no lifetime is specified, the NAT-PMP recommended lifetime of two hours will be used.
-/// # Notes
-/// * A lifetime of `0` will request the gateway to delete the port mapping immediately.
-///   * This can be paired with a local port of `0` to delete all mappings for the protocol.
-/// # Errors
-/// May fail from issues encountered by the UDP socket, the gateway not responding, or the gateway giving an invalid response.
-pub async fn try_port_mapping(
+/// A port mapping on the gateway. Should be renewed with `.try_renew()` and deleted from the gateway with `.try_drop()`.
+pub struct PortMapping {
+    /// The address of the gateway the mapping is registered with.
     gateway: IpAddr,
-    client: IpAddr,
+    /// The protocol the mapping is for.
     protocol: InternetProtocol,
+    /// The internal/local port of the port mapping.
     internal_port: u16,
-    external_port: Option<u16>,
-    lifetime_seconds: Option<u32>,
-) -> Result<PortMapping, MappingFailure> {
-    // Try to use the more modern protocol, PCP, first.
-    match pcp::try_port_mapping(
-        gateway,
-        client,
-        protocol,
-        internal_port,
-        external_port,
-        lifetime_seconds.unwrap_or(natpmp::RECOMMENDED_MAPPING_LIFETIME_SECONDS),
-    )
-    .await
-    {
-        Ok(m) => return Ok(m),
-        Err(e) => eprintln!("Failed to map port using PCP: {e:#}"),
+    /// The external port of the port mapping.
+    external_port: u16,
+    /// The lifetime of the port mapping in seconds.
+    lifetime_seconds: u32,
+    /// The type of mapping protocol used, as well as any protocol specific parameters.
+    mapping_type: PortMappingType,
+}
+impl PortMapping {
+    /// Attempts to map a port on the gateway using PCP first and falling back to NAT-PMP.
+    /// Will request to use the given external port if specified, otherwise it will let the gateway choose.
+    /// If no lifetime is specified, the NAT-PMP recommended lifetime of two hours will be used.
+    /// # Errors
+    /// Returns a `MappingFailure` enum which decomposes into different errors depending on the cause:
+    /// * `Socket` if there is an error using the UDP socket
+    /// * `Timeout` if the gateway is not responding
+    /// * `InvalidResponse` if the gateway gave an invalid response
+    /// * `ResultCode` if the gateway gave a valid response, but it was an error. Will never return `ResultCode::Success` as an error.
+    pub async fn new(
+        gateway: IpAddr,
+        client: IpAddr,
+        protocol: InternetProtocol,
+        internal_port: std::num::NonZeroU16,
+        external_port: Option<u16>,
+        lifetime_seconds: Option<u32>,
+    ) -> Result<PortMapping, MappingFailure> {
+        // Try to use the more modern protocol, PCP, first.
+        match pcp::try_port_mapping(
+            gateway,
+            client,
+            protocol,
+            internal_port.get(),
+            external_port,
+            lifetime_seconds.unwrap_or(natpmp::RECOMMENDED_MAPPING_LIFETIME_SECONDS),
+        )
+        .await
+        {
+            Ok(m) => return Ok(m),
+            Err(pcp::Failure::ResultCode(pcp::ResultCode::UnsupportedVersion)) => {}
+            Err(e) => eprintln!("Failed to map port using PCP: {e:#}"),
+        }
+
+        // Fall back to the older, possibly more widely supported, NAT-PMP.
+        natpmp::try_port_mapping(gateway, protocol, internal_port.get(), external_port, None)
+            .await
+            .map_err(std::convert::Into::into)
     }
 
-    // Fall back to the older, possibly more widely supported, NAT-PMP.
-    natpmp::try_port_mapping(gateway, protocol, internal_port, external_port, None)
-        .await
-        .map_err(std::convert::Into::into)
+    /// Attempts to renew this port mapping on the gateway, otherwise returns an error.
+    /// # Errors
+    /// Returns a `MappingFailure` enum which decomposes into different errors depending on the cause:
+    /// * `Socket` if there is an error using the UDP socket
+    /// * `Timeout` if the gateway is not responding
+    /// * `InvalidResponse` if the gateway gave an invalid response
+    /// * `ResultCode` if the gateway gave a valid response, but it was an error. Will never return `ResultCode::Success` as an error.
+    pub async fn try_renew(&mut self) -> Result<(), MappingFailure> {
+        // Attempt to renew the existing port mapping on the gateway.
+        match self.mapping_type {
+            PortMappingType::NatPmp => {
+                *self = natpmp::try_port_mapping(
+                    self.gateway,
+                    self.protocol,
+                    self.internal_port,
+                    Some(self.external_port),
+                    Some(self.lifetime()),
+                )
+                .await
+                .map_err(MappingFailure::from)?;
+            }
+            PortMappingType::Pcp { client } => {
+                *self = pcp::try_port_mapping(
+                    self.gateway,
+                    client,
+                    self.protocol,
+                    self.internal_port,
+                    Some(self.external_port),
+                    self.lifetime(),
+                )
+                .await
+                .map_err(MappingFailure::from)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Attempts to safely delete this port mapping on the gateway, otherwise returns an error and the `PortMapping` back.
+    /// # Errors
+    /// Returns a `MappingFailure` enum which decomposes into different errors depending on the cause:
+    /// * `Socket` if there is an error using the UDP socket
+    /// * `Timeout` if the gateway is not responding
+    /// * `InvalidResponse` if the gateway gave an invalid response
+    /// * `ResultCode` if the gateway gave a valid response, but it was an error. Will never return `ResultCode::Success` as an error.
+    pub async fn try_drop(self) -> Result<(), (MappingFailure, Self)> {
+        let gateway = self.gateway();
+        let protocol = self.protocol();
+        let internal_port = self.internal_port();
+        let mapping_type = self.mapping_type();
+
+        // Attempt to delete the port mapping on the gateway.
+        match mapping_type {
+            PortMappingType::NatPmp => natpmp::try_drop_mapping(gateway, protocol, internal_port)
+                .await
+                .map_err(|e| (MappingFailure::from(e), self)),
+            PortMappingType::Pcp { client } => {
+                pcp::try_drop_mapping(gateway, client, protocol, internal_port)
+                    .await
+                    .map_err(|e| (MappingFailure::from(e), self))
+            }
+        }
+    }
+
+    #[must_use]
+    pub fn gateway(&self) -> IpAddr {
+        self.gateway
+    }
+    #[must_use]
+    pub fn protocol(&self) -> InternetProtocol {
+        self.protocol
+    }
+    #[must_use]
+    pub fn internal_port(&self) -> u16 {
+        self.internal_port
+    }
+    #[must_use]
+    pub fn external_port(&self) -> u16 {
+        self.external_port
+    }
+    #[must_use]
+    pub fn lifetime(&self) -> u32 {
+        self.lifetime_seconds
+    }
+    #[must_use]
+    pub fn mapping_type(&self) -> PortMappingType {
+        self.mapping_type
+    }
 }
 
 /// Private module for shared helper functions within the library.
@@ -134,15 +248,15 @@ mod helpers {
 
     pub enum RequestSendError {
         Socket(std::io::Error),
-        Timeout(),
+        Timeout,
     }
 
     /// Send a request and wait for a response, retrying on timeout up to `max_retries` times.
     /// # Errors
-    /// Will return an error if we:
-    /// * Fail to send the request
-    /// * Fail to receive a response within the timeouts and retries
-    /// * If there is a network error on receiving the response
+    /// Will return a `Socket(..)` error if we:
+    /// * Failed to send data on the socket
+    /// * Failed to receive data on the socket
+    /// Otherwise, will return a `Timeout` error if the gateway could not be reached after all retries.
     pub async fn try_send_until_response(
         max_retries: usize,
         initial_timeout: Duration,
@@ -164,7 +278,7 @@ mod helpers {
 
             tokio::time::timeout(timeout, socket.recv_buf(recv_buf))
                 .await
-                .map_err(|_| RequestSendError::Timeout())?
+                .map_err(|_| RequestSendError::Timeout)?
                 .map_err(RequestSendError::Socket)
         }
 
@@ -177,9 +291,9 @@ mod helpers {
                 Ok(n) => return Ok(n),
 
                 // Retry on timeout up to `max_retries` times.
-                Err(RequestSendError::Timeout()) => {
+                Err(RequestSendError::Timeout) => {
                     if retries >= max_retries {
-                        return Err(RequestSendError::Timeout());
+                        return Err(RequestSendError::Timeout);
                     }
                     retries += 1;
 
@@ -188,7 +302,7 @@ mod helpers {
                     wait += wait;
 
                     #[cfg(debug_assertions)]
-                    println!("Retrying with timeout {wait:?}: {retries}/{max_retries} retries");
+                    println!("DEBUG Starting retry {retries}/{max_retries} with timeout {wait:?}");
                 }
 
                 // Any other error is returned immediately.
@@ -199,9 +313,11 @@ mod helpers {
 }
 
 /// Errors that occur during the respective port mapping protocols.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum MappingFailure {
+    #[error("NAT-PMP({0})")]
     NatPmp(natpmp::Failure),
+    #[error("PCP({0})")]
     Pcp(pcp::Failure),
 }
 impl From<natpmp::Failure> for MappingFailure {

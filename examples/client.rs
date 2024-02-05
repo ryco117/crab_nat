@@ -19,6 +19,10 @@ struct Cli {
     /// The external port to try to map. Server is not guaranteed to use this port.
     #[arg(short = 'e', long)]
     external_port: Option<u16>,
+
+    /// Fetch the external IP address through NAT-PMP and exit.
+    #[arg(short = 'x', long)]
+    external_ip: bool,
 }
 
 #[tokio::main]
@@ -45,12 +49,14 @@ async fn main() {
     };
     println!("Using local address: {local_address:#}");
 
-    // Attempt a NAT-PMP request to get the external IP.
-    let external_ip = match crab_nat::natpmp::try_external_address(gateway).await {
-        Ok(ip) => ip,
-        Err(e) => return eprintln!("Failed to get external IP: {e:#}"),
-    };
-    println!("External IP: {external_ip:#}");
+    // If the external IP flag is set, attempt to get the external IP and exit.
+    if args.external_ip {
+        let external_ip = match crab_nat::natpmp::try_external_address(gateway).await {
+            Ok(ip) => ip,
+            Err(e) => return eprintln!("Failed to get external IP: {e:#}"),
+        };
+        return println!("External IP: {external_ip:#}");
+    }
 
     if args.delete {
         // Attempt a port unmapping request.
@@ -68,28 +74,38 @@ async fn main() {
         println!("Success! Deleted previous port mapping");
     } else {
         // Attempt a port mapping request.
-        let crab_nat::PortMapping {
-            protocol,
-            internal_port,
-            external_port,
-            lifetime,
-            version,
-            ..
-        } = match crab_nat::try_port_mapping(
+        let mapping = match crab_nat::PortMapping::new(
             gateway,
             local_address,
             crab_nat::InternetProtocol::Tcp,
-            args.internal_port,
+            std::num::NonZeroU16::new(args.internal_port).expect("Invalid internal port"),
             args.external_port,
             None,
         )
         .await
         {
             Ok(m) => m,
-            Err(e) => return eprintln!("Failed to map port: {e:?}"),
+            Err(e) => return eprintln!("Failed to map port: {e:#}"),
         };
+        let protocol = mapping.mapping_type();
+        let external_port = mapping.external_port();
+        let internal_port = mapping.internal_port();
+        let lifetime = mapping.lifetime();
+        let mapping_type = mapping.mapping_type();
 
         // Print the mapped port information.
-        println!("Success!\nMapped protocol {protocol:?} on external port {external_port} to internal port {internal_port} with a lifetime of {lifetime:?} using version {version:?}");
+        println!("Successfully mapped protocol {protocol:?} on external port {external_port} to internal port {internal_port} with a lifetime of {lifetime:?} using version {mapping_type:?}");
+
+        // Try to safely drop the mapping.
+        if let Err((e, m)) = mapping.try_drop().await {
+            eprintln!(
+                "Failed to drop mapping {}:{}->{}: {e:?}",
+                m.gateway(),
+                m.external_port(),
+                m.internal_port()
+            );
+        } else {
+            println!("Successfully deleted the mapping...");
+        }
     }
 }

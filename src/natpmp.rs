@@ -8,7 +8,7 @@ use num_enum::TryFromPrimitive;
 
 use crate::{
     helpers::{self, RequestSendError},
-    InternetProtocol, PortMapping, Version, SANE_MAX_REQUEST_RETRIES,
+    InternetProtocol, PortMapping, PortMappingType, VersionCode, SANE_MAX_REQUEST_RETRIES,
 };
 
 /// The RFC recommended lifetime for a port mapping.
@@ -65,7 +65,7 @@ pub enum Failure {
 
     /// The gateway was unreachable within the timeout.
     #[error("Gateway did not respond within the timeout")]
-    Timeout(),
+    Timeout,
 
     /// The gateway did not give a valid response according to the NAT-PMP protocol.
     #[error("Invalid response: {0}")]
@@ -81,7 +81,7 @@ impl From<RequestSendError> for Failure {
     fn from(e: RequestSendError) -> Self {
         match e {
             RequestSendError::Socket(e) => Failure::Socket(e),
-            RequestSendError::Timeout() => Failure::Timeout(),
+            RequestSendError::Timeout => Failure::Timeout,
         }
     }
 }
@@ -107,7 +107,10 @@ pub async fn try_external_address(gateway: IpAddr) -> Result<Ipv4Addr, Failure> 
         SANE_MAX_REQUEST_RETRIES,
         Duration::from_millis(FIRST_TIMEOUT_MILLIS),
         &socket,
-        &[Version::NatPmp as u8, OperationCode::ExternalAddress as u8],
+        &[
+            VersionCode::NatPmp as u8,
+            OperationCode::ExternalAddress as u8,
+        ],
         &mut reader,
     )
     .await?;
@@ -120,11 +123,11 @@ pub async fn try_external_address(gateway: IpAddr) -> Result<Ipv4Addr, Failure> 
     }
 
     // Read and verify the version and operation bytes.
-    let v = Version::try_from(reader.get_u8())
+    let v = VersionCode::try_from(reader.get_u8())
         .map_err(|v| Failure::InvalidResponse(format!("Invalid version: {v:#}")))?;
     let op = response_to_opcode(reader.get_u8())
         .map_err(|o| Failure::InvalidResponse(format!("Invalid operation code: {o:#}")))?;
-    if v != Version::NatPmp {
+    if v != VersionCode::NatPmp {
         return Err(Failure::InvalidResponse(format!(
             "Unsupported version: {v:?}"
         )));
@@ -140,7 +143,7 @@ pub async fn try_external_address(gateway: IpAddr) -> Result<Ipv4Addr, Failure> 
         .map_err(|r| Failure::InvalidResponse(format!("Invalid result code: {r:#}")))?;
     let gateway_epoch = Duration::from_secs(u64::from(reader.get_u32()));
     #[cfg(debug_assertions)]
-    println!("Gateway epoch was {gateway_epoch:?} ago");
+    println!("DEBUG Gateway epoch was {gateway_epoch:?} ago");
 
     if result_code != ResultCode::Success {
         // The server gave us a correct response, but it was an error.
@@ -156,7 +159,7 @@ pub async fn try_external_address(gateway: IpAddr) -> Result<Ipv4Addr, Failure> 
     );
 
     #[cfg(debug_assertions)]
-    println!("Gateway external IP: {external_ip:#}");
+    println!("DEBUG Gateway external IP: {external_ip:#}");
 
     Ok(external_ip)
 }
@@ -191,7 +194,7 @@ pub async fn try_port_mapping(
     let mut bb = bytes::BytesMut::with_capacity(MAX_DATAGRAM_SIZE << 1);
 
     // Format the port mapping request.
-    bb.put_u8(Version::NatPmp as u8);
+    bb.put_u8(VersionCode::NatPmp as u8);
     bb.put_u8(req_op as u8);
     bb.put_u16(0); // Reserved.
     bb.put_u16(internal_port);
@@ -219,11 +222,11 @@ pub async fn try_port_mapping(
     }
 
     // Read and verify the version and operation bytes.
-    let v = Version::try_from(bb.get_u8())
+    let v = VersionCode::try_from(bb.get_u8())
         .map_err(|v| Failure::InvalidResponse(format!("Invalid version: {v:#}")))?;
     let op = response_to_opcode(bb.get_u8())
         .map_err(|o| Failure::InvalidResponse(format!("Invalid operation code: {o:#}")))?;
-    if v != Version::NatPmp {
+    if v != VersionCode::NatPmp {
         return Err(Failure::InvalidResponse(format!(
             "Unsupported version: {v:?}"
         )));
@@ -242,8 +245,10 @@ pub async fn try_port_mapping(
     let response_code = ResultCode::try_from(bb.get_u16())
         .map_err(|r| Failure::InvalidResponse(format!("Invalid result code: {r:#}")))?;
     let gateway_epoch = Duration::from_secs(u64::from(bb.get_u32()));
+
     #[cfg(debug_assertions)]
-    println!("Gateway epoch was {gateway_epoch:?} ago");
+    println!("DEBUG Gateway epoch was {gateway_epoch:?} ago");
+
     if response_code != ResultCode::Success {
         // The server gave us a correct response, but it was an error.
         return Err(Failure::ResultCode(response_code));
@@ -252,15 +257,15 @@ pub async fn try_port_mapping(
     // The response was a success, read the mapping information.
     let internal_port = bb.get_u16();
     let external_port = bb.get_u16();
-    let lifetime = Duration::from_secs(u64::from(bb.get_u32()));
+    let lifetime_seconds = bb.get_u32();
 
     Ok(PortMapping {
         gateway,
         protocol,
         internal_port,
         external_port,
-        lifetime,
-        version: v,
+        lifetime_seconds,
+        mapping_type: PortMappingType::NatPmp,
     })
 }
 
@@ -282,14 +287,14 @@ pub async fn try_drop_mapping(
     let PortMapping {
         internal_port,
         external_port,
-        lifetime,
+        lifetime_seconds,
         ..
     } = try_port_mapping(gateway, protocol, local_port, Some(0), Some(0)).await?;
 
     // Check that the response is correct for a deletion request.
-    if internal_port != local_port || external_port != 0 || !lifetime.is_zero() {
+    if internal_port != local_port || external_port != 0 || lifetime_seconds != 0 {
         return Err(Failure::InvalidResponse(format!(
-            "Invalid response to deletion request: {internal_port} {external_port} {lifetime:?}"
+            "Invalid response to deletion request: {internal_port} {external_port} {lifetime_seconds:?}"
         )));
     }
 

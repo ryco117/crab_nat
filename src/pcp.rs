@@ -7,7 +7,7 @@ use bytes::{Buf as _, BufMut as _};
 
 use crate::{
     helpers::{self, RequestSendError},
-    InternetProtocol, PortMapping, Version, SANE_MAX_REQUEST_RETRIES,
+    InternetProtocol, PortMapping, PortMappingType, VersionCode, SANE_MAX_REQUEST_RETRIES,
 };
 
 /// The RFC states that the first response timeout "SHOULD be 3 seconds."
@@ -86,7 +86,7 @@ pub enum Failure {
 
     /// The gateway was unreachable within the timeout.
     #[error("Gateway did not respond within the timeout")]
-    Timeout(),
+    Timeout,
 
     /// The gateway did not give a valid response according to the NAT-PMP protocol.
     #[error("Invalid response: {0}")]
@@ -102,7 +102,7 @@ impl From<RequestSendError> for Failure {
     fn from(e: RequestSendError) -> Self {
         match e {
             RequestSendError::Socket(e) => Failure::Socket(e),
-            RequestSendError::Timeout() => Failure::Timeout(),
+            RequestSendError::Timeout => Failure::Timeout,
         }
     }
 }
@@ -137,7 +137,7 @@ pub async fn try_port_mapping(
     let mut bb = bytes::BytesMut::with_capacity(MAX_DATAGRAM_SIZE << 1);
 
     // Create the common PCP request header.
-    bb.put_u8(Version::Pcp as u8);
+    bb.put_u8(VersionCode::Pcp as u8);
     bb.put_u8(opcode_to_request(OperationCode::Map));
     bb.put_u16(0); // Reserved.
     bb.put_u32(lifetime_seconds);
@@ -172,17 +172,26 @@ pub async fn try_port_mapping(
 
     // All valid PCP responses have at least 24 bytes, see <https://www.rfc-editor.org/rfc/rfc6887#section-7.2>.
     if n < 24 {
-        // TODO: If the version byte is zero and there is a result code of unsupported version, relay this as the failure.
         let bits = &bb[..n];
+
+        // Check if the resposne header matches a `natpmp::ResultCode::UnsupportedVersion` since older devices may not support PCP.
+        if n >= 4
+            && bits[0] == 0
+            && crate::natpmp::ResultCode::try_from((u16::from(bits[2]) << 8) + u16::from(bits[3]))
+                .is_ok_and(|r| r == crate::natpmp::ResultCode::UnsupportedVersion)
+        {
+            return Err(Failure::ResultCode(ResultCode::UnsupportedVersion));
+        }
+
         return Err(Failure::InvalidResponse(format!(
             "Too few bytes received: {bits:X?}"
         )));
     }
 
     // Parse the PCP response header.
-    let v = Version::try_from(bb.get_u8())
+    let v = VersionCode::try_from(bb.get_u8())
         .map_err(|v| Failure::InvalidResponse(format!("Invalid version: {v:#}")))?;
-    if v != Version::Pcp {
+    if v != VersionCode::Pcp {
         return Err(Failure::InvalidResponse(format!(
             "Unsupported version: {v:?}"
         )));
@@ -203,7 +212,7 @@ pub async fn try_port_mapping(
     let epoch_seconds = bb.get_u32();
 
     #[cfg(debug_assertions)]
-    println!("Received a response with result code {result_code:#} and lifetime {lifetime_seconds} seconds, at {epoch_seconds}");
+    println!("DEBUG Received a response with result code {result_code:#} and lifetime {lifetime_seconds} seconds, at {epoch_seconds}");
 
     if result_code != ResultCode::Success {
         // The server gave us a correct response, but it was an error.
@@ -217,7 +226,7 @@ pub async fn try_port_mapping(
     let response_nonce = [bb.get_u32(), bb.get_u32(), bb.get_u32()];
     if response_nonce != nonce {
         // If we received a message with a different nonce, fail with a timeout to retry.
-        return Err(Failure::Timeout());
+        return Err(Failure::Timeout);
     }
     let response_protocol = bb.get_u8();
     if response_protocol != protocol_to_byte(protocol) {
@@ -254,15 +263,15 @@ pub async fn try_port_mapping(
         IpAddr::V6(external_ip)
     };
     #[cfg(debug_assertions)]
-    println!("Server assigned us external IP {external_ip:#}");
+    println!("DEBUG Server assigned us external IP {external_ip:#}");
 
     Ok(PortMapping {
         gateway,
         protocol,
         internal_port,
         external_port,
-        lifetime: Duration::from_secs(u64::from(lifetime_seconds)),
-        version: Version::Pcp,
+        lifetime_seconds,
+        mapping_type: PortMappingType::Pcp { client },
     })
 }
 
@@ -285,14 +294,14 @@ pub async fn try_drop_mapping(
     let PortMapping {
         internal_port,
         external_port,
-        lifetime,
+        lifetime_seconds,
         ..
     } = try_port_mapping(gateway, client, protocol, local_port, Some(0), 0).await?;
 
     // Check that the response is correct for a deletion request.
-    if internal_port != local_port || external_port != 0 || !lifetime.is_zero() {
+    if internal_port != local_port || external_port != 0 || lifetime_seconds != 0 {
         return Err(Failure::InvalidResponse(format!(
-            "Invalid response to deletion request: {internal_port} {external_port} {lifetime:?}"
+            "Invalid response to deletion request: {internal_port} {external_port} {lifetime_seconds:?}"
         )));
     }
 

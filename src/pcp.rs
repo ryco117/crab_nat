@@ -1,8 +1,14 @@
-use std::net::IpAddr;
+use std::{
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    time::Duration,
+};
 
 use bytes::{Buf as _, BufMut as _};
 
-use crate::{helpers, natpmp::RECOMMENDED_MAPPING_LIFETIME_SECONDS, Version};
+use crate::{
+    helpers::{self, RequestSendError},
+    InternetProtocol, PortMapping, Version, SANE_MAX_REQUEST_RETRIES,
+};
 
 /// The RFC states that the first response timeout "SHOULD be 3 seconds."
 /// <https://www.rfc-editor.org/rfc/rfc6887#section-8.1.1>
@@ -15,22 +21,49 @@ pub const MAX_DATAGRAM_SIZE: usize = 1100;
 
 /// Valid result codes from a PCP response.
 /// See <https://www.rfc-editor.org/rfc/rfc6887#section-7.4>
-#[derive(num_enum::TryFromPrimitive)]
+#[derive(Debug, displaydoc::Display, thiserror::Error, PartialEq, num_enum::TryFromPrimitive)]
 #[repr(u8)]
 pub enum ResultCode {
+    /// Success. Will not be returned as an error.
     Success,
+
+    /// The server does not support this version of the protocol.
     UnsupportedVersion,
+
+    /// The server did not authorize the operation.
     NotAuthorized,
+
+    /// The request was formatted incorrectly.
     MalformedRequest,
+
+    /// The server does not support the requested operation.
     UnsupportedOpcode,
+
+    /// The server does not support a required option.
     UnsupportedOption,
+
+    /// An option was formatted incorrectly.
     MalformedOption,
+
+    /// The server is experiencing a temporary network failure.
     NetworkFailure,
+
+    /// The server is lacking resources to complete the request.
     NoResources,
+
+    /// The server does not support the requested protocol.
     UnsupportedProtocol,
+
+    /// Our port mapping quota with the server has been reached.
     UserExceededQuota,
+
+    /// The server cannot provide the requested external address.
     CannotProvideExternal,
+
+    /// The given client address differs from what the server sees.
     AddressMismatch,
+
+    /// The server is not able to create the requested filters.
     ExcessiveRemotePeers,
 }
 
@@ -38,75 +71,230 @@ pub enum ResultCode {
 #[derive(Debug, num_enum::TryFromPrimitive, PartialEq)]
 #[repr(u8)]
 pub enum OperationCode {
-    ///
-    Announce,
     /// Map a UDP port on the gateway.
-    Map,
+    Map = 1,
     /// Map a TCP port on the gateway.
     Peer,
 }
 
-// https://www.rfc-editor.org/rfc/rfc6887#section-8.1
-pub async fn try_port_mapping(gateway: IpAddr, client: IpAddr) -> anyhow::Result<()> {
-    let socket = helpers::new_socket(gateway).await?;
+#[derive(Debug, thiserror::Error)]
+/// Errors that may occur when trying to map a port on the gateway, categorized by the root of the issue.
+pub enum Failure {
+    /// Failed to bind, connect, read, or write to a UDP socket.
+    #[error("UDP socket error: {0}")]
+    Socket(std::io::Error),
 
-    // Need to connect to a gateway using the same internet protocol version as the client.
-    if gateway.is_ipv4() != client.is_ipv4() {
-        anyhow::bail!("Gateway and client addresses must be of the same IP version")
+    /// The gateway was unreachable within the timeout.
+    #[error("Gateway did not respond within the timeout")]
+    Timeout(),
+
+    /// The gateway did not give a valid response according to the NAT-PMP protocol.
+    #[error("Invalid response: {0}")]
+    InvalidResponse(String),
+
+    /// The gateway gave a valid response, but it was an error.
+    /// The `ResultCode` is guaranteed to not be `ResultCode::Success`.
+    #[error("Gateway error: {0}")]
+    ResultCode(ResultCode),
+}
+
+impl From<RequestSendError> for Failure {
+    fn from(e: RequestSendError) -> Self {
+        match e {
+            RequestSendError::Socket(e) => Failure::Socket(e),
+            RequestSendError::Timeout() => Failure::Timeout(),
+        }
     }
+}
+
+/// Attempts to map a port on the gateway using PCP.
+/// Will try to use the given external port if it is `Some`, otherwise it will let the gateway choose.
+/// # Errors
+/// Returns a `pcp::Failure` enum which decomposes into different errors depending on the cause:
+/// * `Socket` if there is an error using the UDP socket
+/// * `Timeout` if the gateway is not responding
+/// * `InvalidResponse` if the gateway gave an invalid response
+/// * `ResultCode` if the gateway gave a valid response, but it was an error. Will never return `ResultCode::Success` as an error.
+pub async fn try_port_mapping(
+    gateway: IpAddr,
+    client: IpAddr,
+    protocol: InternetProtocol,
+    internal_port: u16,
+    req_external_port: Option<u16>,
+    lifetime_seconds: u32,
+) -> Result<PortMapping, Failure> {
+    let socket = helpers::new_socket(gateway)
+        .await
+        .map_err(Failure::Socket)?;
 
     // PCP addresses are always specified as 128 bit addresses, <https://www.rfc-editor.org/rfc/rfc6887#section-5>.
     // We need to map `Ipv4Addr` accoriding to RFC4291 <https://www.rfc-editor.org/rfc/rfc4291>.
-    let client_ip6_bytes = match client {
-        IpAddr::V4(v4) => v4.to_ipv6_mapped(),
-        IpAddr::V6(v6) => v6,
-    }
-    .octets();
+    let (client_ip6_bytes, zero_addr_ip6_bytes) = match client {
+        IpAddr::V4(v4) => (v4.to_ipv6_mapped(), Ipv4Addr::UNSPECIFIED.to_ipv6_mapped()),
+        IpAddr::V6(v6) => (v6, Ipv6Addr::UNSPECIFIED),
+    };
 
     let mut bb = bytes::BytesMut::with_capacity(MAX_DATAGRAM_SIZE << 1);
 
-    // Create the mapping request header.
+    // Create the common PCP request header.
     bb.put_u8(Version::Pcp as u8);
     bb.put_u8(opcode_to_request(OperationCode::Map));
     bb.put_u16(0); // Reserved.
-    bb.put_u32(RECOMMENDED_MAPPING_LIFETIME_SECONDS);
-    bb.put(&client_ip6_bytes[..]);
+    bb.put_u32(lifetime_seconds);
+    bb.put(&client_ip6_bytes.octets()[..]);
 
-    // .....
+    // Generate 96 random bits for the nonce.
+    let nonce: [u32; 3] = [rand::random(), rand::random(), rand::random()];
+
+    // Create the mapping specific request.
+    bb.put_u32(nonce[0]);
+    bb.put_u32(nonce[1]);
+    bb.put_u32(nonce[2]);
+    bb.put_u8(protocol_to_byte(protocol));
+    bb.put(&[0u8; 3][..]); // Reserved.
+    bb.put_u16(internal_port);
+    bb.put_u16(req_external_port.unwrap_or_default());
+    bb.put(&zero_addr_ip6_bytes.octets()[..]); // No preference on external address.
 
     // Send the request to the gateway.
     let request = bb.split();
-    socket.send(&request).await?;
 
-    // TODO: https://www.rfc-editor.org/rfc/rfc6887#section-6 indicates "exponentially increasing intervals"[pg.12]
-    // on for retransmissions, similar to NAT-PMP. There is an opportunity to leverage common code between the two protocols.
-    // https://www.rfc-editor.org/rfc/rfc6887#section-8.1.1 Expands on this in detail.
-    let n = socket.recv_buf(&mut bb).await?;
+    // https://www.rfc-editor.org/rfc/rfc6887#section-8.1.1 TODO: Expands on PCP timing in detail.
+    let n = helpers::try_send_until_response(
+        SANE_MAX_REQUEST_RETRIES,
+        Duration::from_secs(u64::from(FIRST_TIMEOUT_SECONDS)),
+        &socket,
+        &request,
+        &mut bb,
+    )
+    .await
+    .map_err(Failure::from)?;
 
     // All valid PCP responses have at least 24 bytes, see <https://www.rfc-editor.org/rfc/rfc6887#section-7.2>.
     if n < 24 {
-        anyhow::bail!("Received a response that is too short to be valid")
+        // TODO: If the version byte is zero and there is a result code of unsupported version, relay this as the failure.
+        let bits = &bb[..n];
+        return Err(Failure::InvalidResponse(format!(
+            "Too few bytes received: {bits:X?}"
+        )));
     }
 
-    // Parse the response.
-    let v = Version::try_from(bb.get_u8())?;
+    // Parse the PCP response header.
+    let v = Version::try_from(bb.get_u8())
+        .map_err(|v| Failure::InvalidResponse(format!("Invalid version: {v:#}")))?;
     if v != Version::Pcp {
-        anyhow::bail!("Received a response with an unexpected version {v:?}")
+        return Err(Failure::InvalidResponse(format!(
+            "Unsupported version: {v:?}"
+        )));
     }
-    let op = response_to_opcode(bb.get_u8())?;
+    let op = response_to_opcode(bb.get_u8())
+        .map_err(|op| Failure::InvalidResponse(format!("Invalid operation code: {op:#}")))?;
     if op != OperationCode::Map {
-        anyhow::bail!("Received a response with an unexpected operation code {op:?}")
+        return Err(Failure::InvalidResponse(format!(
+            "Incorrect opcode: {op:?}"
+        )));
     }
-
     let _ = bb.get_u8(); // Reserved.
-    let result_code = ResultCode::try_from(bb.get_u8())?;
+    let result_code = ResultCode::try_from(bb.get_u8())
+        .map_err(|r| Failure::InvalidResponse(format!("Invalid result code: {r:#}")))?;
 
     // On error, lifetime indicates the number of seconds until the error is expected to be resolved.
     let lifetime_seconds = bb.get_u32();
     let epoch_seconds = bb.get_u32();
 
+    #[cfg(debug_assertions)]
+    println!("Received a response with result code {result_code:#} and lifetime {lifetime_seconds} seconds, at {epoch_seconds}");
+
+    if result_code != ResultCode::Success {
+        // The server gave us a correct response, but it was an error.
+        return Err(Failure::ResultCode(result_code));
+    }
+
     // Reserved. Returns the last 96 bits of the 128 bit address on failure. Must be ignored on success.
     let _ = [bb.get_u32(), bb.get_u32(), bb.get_u32()];
+
+    // Validate the mapping response values.
+    let response_nonce = [bb.get_u32(), bb.get_u32(), bb.get_u32()];
+    if response_nonce != nonce {
+        // If we received a message with a different nonce, fail with a timeout to retry.
+        return Err(Failure::Timeout());
+    }
+    let response_protocol = bb.get_u8();
+    if response_protocol != protocol_to_byte(protocol) {
+        return Err(Failure::InvalidResponse(format!(
+            "Incorrect protocol: {response_protocol:?}"
+        )));
+    }
+    let _ = [bb.get_u8(), bb.get_u8(), bb.get_u8()]; // Reserved.
+
+    let response_internal_port = bb.get_u16();
+    if response_internal_port != internal_port {
+        return Err(Failure::InvalidResponse(format!(
+            "Incorrect internal port returned: {response_internal_port:?}"
+        )));
+    }
+
+    // The external port assigned to our mapping. The server may not use the requested port, if present.
+    let external_port = bb.get_u16();
+
+    // The external IP address assigned to our mapping.
+    let external_ip = Ipv6Addr::new(
+        bb.get_u16(),
+        bb.get_u16(),
+        bb.get_u16(),
+        bb.get_u16(),
+        bb.get_u16(),
+        bb.get_u16(),
+        bb.get_u16(),
+        bb.get_u16(),
+    );
+    let external_ip = if let Some(ip) = external_ip.to_ipv4_mapped() {
+        IpAddr::V4(ip)
+    } else {
+        IpAddr::V6(external_ip)
+    };
+    #[cfg(debug_assertions)]
+    println!("Server assigned us external IP {external_ip:#}");
+
+    Ok(PortMapping {
+        gateway,
+        protocol,
+        internal_port,
+        external_port,
+        lifetime: Duration::from_secs(u64::from(lifetime_seconds)),
+        version: Version::Pcp,
+    })
+}
+
+/// Attempts to remove a PCP mapping on the gateway.
+/// Using a local port of `0` will remove all port mappings for our client with the given protocol.
+/// # Errors
+/// Returns a `pcp::Failure` enum which decomposes into different errors depending on the cause:
+/// * `Socket` if there is an error using the UDP socket
+/// * `Timeout` if the gateway is not responding
+/// * `InvalidResponse` if the gateway gave an invalid response
+/// * `ResultCode` if the gateway gave a valid response, but it was an error. Will never return `ResultCode::Success` as an error.
+pub async fn try_drop_mapping(
+    gateway: IpAddr,
+    client: IpAddr,
+    protocol: InternetProtocol,
+    local_port: u16,
+) -> Result<(), Failure> {
+    // Mapping deletion is specified by the same operation code and format as mapping creation.
+    // The difference is that the lifetime and external port must be set to `0`.
+    let PortMapping {
+        internal_port,
+        external_port,
+        lifetime,
+        ..
+    } = try_port_mapping(gateway, client, protocol, local_port, Some(0), 0).await?;
+
+    // Check that the response is correct for a deletion request.
+    if internal_port != local_port || external_port != 0 || !lifetime.is_zero() {
+        return Err(Failure::InvalidResponse(format!(
+            "Invalid response to deletion request: {internal_port} {external_port} {lifetime:?}"
+        )));
+    }
 
     Ok(())
 }
@@ -123,4 +311,13 @@ fn response_to_opcode(
     op: u8,
 ) -> Result<OperationCode, num_enum::TryFromPrimitiveError<OperationCode>> {
     OperationCode::try_from((op - 1) >> 1)
+}
+
+/// Convert the `InternetProtocol` enum into the byte expected by the PCP protocol.
+fn protocol_to_byte(protocol: InternetProtocol) -> u8 {
+    // RFC specifies it uses values from IANA, <https://www.iana.org/assignments/protocol-numbers/protocol-numbers.xhtml>.
+    match protocol {
+        InternetProtocol::Tcp => 6,
+        InternetProtocol::Udp => 17,
+    }
 }

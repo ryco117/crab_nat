@@ -5,9 +5,11 @@ use std::{
 
 use bytes::{Buf, BufMut};
 use num_enum::TryFromPrimitive;
-use tokio::net::UdpSocket;
 
-use crate::{helpers, InternetProtocol, PortMapping, Version};
+use crate::{
+    helpers::{self, RequestSendError},
+    InternetProtocol, PortMapping, Version, SANE_MAX_REQUEST_RETRIES,
+};
 
 /// The RFC recommended lifetime for a port mapping.
 pub const RECOMMENDED_MAPPING_LIFETIME_SECONDS: u32 = 7200;
@@ -55,6 +57,7 @@ pub enum OperationCode {
 }
 
 #[derive(Debug, thiserror::Error)]
+/// Errors that may occur when trying to map a port on the gateway, categorized by the root of the issue.
 pub enum Failure {
     /// Failed to bind, connect, read, or write to a UDP socket.
     #[error("UDP socket error: {0}")]
@@ -62,7 +65,7 @@ pub enum Failure {
 
     /// The gateway was unreachable within the timeout.
     #[error("Gateway did not respond within the timeout")]
-    Timeout(()),
+    Timeout(),
 
     /// The gateway did not give a valid response according to the NAT-PMP protocol.
     #[error("Invalid response: {0}")]
@@ -72,6 +75,15 @@ pub enum Failure {
     /// The `ResultCode` is guaranteed to not be `ResultCode::Success`.
     #[error("Gateway error: {0}")]
     ResultCode(ResultCode),
+}
+
+impl From<RequestSendError> for Failure {
+    fn from(e: RequestSendError) -> Self {
+        match e {
+            RequestSendError::Socket(e) => Failure::Socket(e),
+            RequestSendError::Timeout() => Failure::Timeout(),
+        }
+    }
 }
 
 /// Attempt to complete the `ExternalAddress` operation.
@@ -91,8 +103,9 @@ pub async fn try_external_address(gateway: IpAddr) -> Result<Ipv4Addr, Failure> 
     // Use a byte-buffer to read the response into.
     let mut reader = bytes::BytesMut::with_capacity(MAX_DATAGRAM_SIZE);
     // Try to send the request data until a response is read, respecting the RFC recommended timeouts and retries counts.
-    let n = try_send_until_response(
-        crate::SANE_MAX_REQUEST_RETRIES,
+    let n = helpers::try_send_until_response(
+        SANE_MAX_REQUEST_RETRIES,
+        Duration::from_millis(FIRST_TIMEOUT_MILLIS),
         &socket,
         &[Version::NatPmp as u8, OperationCode::ExternalAddress as u8],
         &mut reader,
@@ -123,14 +136,15 @@ pub async fn try_external_address(gateway: IpAddr) -> Result<Ipv4Addr, Failure> 
     }
 
     // Read and verify the result code. Also, optionally print the gateway epoch.
-    let response_code = ResultCode::try_from(reader.get_u16())
+    let result_code = ResultCode::try_from(reader.get_u16())
         .map_err(|r| Failure::InvalidResponse(format!("Invalid result code: {r:#}")))?;
     let gateway_epoch = Duration::from_secs(u64::from(reader.get_u32()));
     #[cfg(debug_assertions)]
     println!("Gateway epoch was {gateway_epoch:?} ago");
-    if response_code != ResultCode::Success {
+
+    if result_code != ResultCode::Success {
         // The server gave us a correct response, but it was an error.
-        return Err(Failure::ResultCode(response_code));
+        return Err(Failure::ResultCode(result_code));
     }
 
     // The response was a success, read the remaining 4 bytes as the external IP.
@@ -188,8 +202,14 @@ pub async fn try_port_mapping(
     let send_buf = bb.split();
 
     // Try to send the request data until a response is read, respecting the RFC recommended timeouts and retries counts.
-    let n = try_send_until_response(crate::SANE_MAX_REQUEST_RETRIES, &socket, &send_buf, &mut bb)
-        .await?;
+    let n = helpers::try_send_until_response(
+        SANE_MAX_REQUEST_RETRIES,
+        Duration::from_millis(FIRST_TIMEOUT_MILLIS),
+        &socket,
+        &send_buf,
+        &mut bb,
+    )
+    .await?;
 
     // A port mapping response is always expected to be 16 bytes.
     if n != 16 {
@@ -274,61 +294,6 @@ pub async fn try_drop_mapping(
     }
 
     Ok(())
-}
-
-/// Send a request and wait for a response, retrying on timeout up to `max_retries` times.
-/// # Errors
-/// Will return an error if we:
-/// * Fail to send the request
-/// * Fail to receive a response within the timeouts and retries
-/// * If there is a network error on receiving the response
-pub async fn try_send_until_response(
-    max_retries: usize,
-    socket: &UdpSocket,
-    send_bytes: &[u8],
-    recv_buf: &mut bytes::BytesMut,
-) -> Result<usize, Failure> {
-    // Create an internal helper to easily try sending and receiving packets, and springboard errors back to the caller.
-    async fn send_and_recv(
-        socket: &UdpSocket,
-        send_bytes: &[u8],
-        recv_buf: &mut bytes::BytesMut,
-        timeout: Duration,
-    ) -> Result<usize, Failure> {
-        socket.send(send_bytes).await.map_err(Failure::Socket)?;
-
-        tokio::time::timeout(timeout, socket.recv_buf(recv_buf))
-            .await
-            .map_err(|_| Failure::Timeout(()))?
-            .map_err(Failure::Socket)
-    }
-
-    // Use the RFC recommended initial timeout and double it on each successive failure.
-    let mut wait = Duration::from_millis(FIRST_TIMEOUT_MILLIS);
-    let mut retries = 0;
-    loop {
-        match send_and_recv(socket, send_bytes, recv_buf, wait).await {
-            // Return the number of bytes read from the response.
-            Ok(n) => return Ok(n),
-
-            // Retry on timeout up to `max_retries` times.
-            Err(Failure::Timeout(())) => {
-                if retries >= max_retries {
-                    return Err(Failure::Timeout(()));
-                }
-                retries += 1;
-
-                // Follow RFC recommendation to double the timeout on each successive failure.
-                wait += wait;
-
-                #[cfg(debug_assertions)]
-                println!("Retrying with timeout {wait:?}: {retries}/{max_retries} retries");
-            }
-
-            // Any other error is returned immediately.
-            Err(e) => return Err(e),
-        }
-    }
 }
 
 /// Response `OperationCode`s are the same as the request `OperationCode`s, but with the 128 bit set.

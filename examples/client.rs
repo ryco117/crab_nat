@@ -1,14 +1,22 @@
 #[derive(clap::Parser)]
 struct Cli {
+    /// Delete the port mapping instead of creating one.
     #[arg(short, long, default_value_t = false)]
     delete: bool,
 
+    /// The gateway address to use. If empty, will attempt to determine the default gateway.
     #[arg(short, long, default_value = "")]
     gateway: String,
 
+    /// The local address the gateway will expect to see our address as. If empty, will attempt to use the default local address.
+    #[arg(short, long, default_value = "")]
+    local_address: String,
+
+    /// The internal port to map into.
     #[arg(short = 'p', long, default_value_t = 8080)]
     internal_port: u16,
 
+    /// The external port to try to map. Server is not guaranteed to use this port.
     #[arg(short = 'e', long)]
     external_port: Option<u16>,
 }
@@ -27,6 +35,15 @@ async fn main() {
         args.gateway.parse().expect("Invalid gateway format")
     };
     println!("Using gateway address: {gateway:#}");
+
+    let local_address = if args.local_address.is_empty() {
+        default_net::interface::get_local_ipaddr().expect("Could not determine a local address")
+    } else {
+        args.local_address
+            .parse()
+            .expect("Invalid local address format")
+    };
+    println!("Using local address: {local_address:#}");
 
     // Attempt a NAT-PMP request to get the external IP.
     let external_ip = match crab_nat::natpmp::try_external_address(gateway).await {
@@ -60,14 +77,16 @@ async fn main() {
             ..
         } = match crab_nat::try_port_mapping(
             gateway,
+            local_address,
             crab_nat::InternetProtocol::Tcp,
             args.internal_port,
             args.external_port,
+            None,
         )
         .await
         {
             Ok(m) => m,
-            Err(e) => return eprintln!("Failed to map port: {e:#}"),
+            Err(e) => return eprintln!("Failed to map port: {e:?}"),
         };
 
         // Print the mapped port information.

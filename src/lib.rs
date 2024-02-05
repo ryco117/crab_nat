@@ -9,7 +9,7 @@
 //! async {
 //!     // Attempt a port mapping request through PCP first and fallback to NAT-PMP.
 //!     let mapping = match crab_nat::try_port_mapping(
-//!         std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 1)) /* address of the PCP server, often a gateway of firewall */,
+//!         std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 1)) /* address of the PCP server, often a gateway or firewall */,
 //!         std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 167)) /* address of our client, as seen by the gateway. Only used by PCP */,
 //!         crab_nat::InternetProtocol::Tcp,
 //!         8080 /* internal port */,

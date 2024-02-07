@@ -8,7 +8,8 @@ use num_enum::TryFromPrimitive;
 
 use crate::{
     helpers::{self, RequestSendError},
-    InternetProtocol, PortMapping, PortMappingType, VersionCode, SANE_MAX_REQUEST_RETRIES,
+    InternetProtocol, PortMapping, PortMappingType, TimeoutConfig, VersionCode,
+    SANE_MAX_REQUEST_RETRIES,
 };
 
 /// The RFC recommended lifetime for a port mapping.
@@ -19,6 +20,13 @@ pub const FIRST_TIMEOUT_MILLIS: u64 = 250;
 
 /// NAT-PMP does not require datagrams larger than 16 bytes.
 pub const MAX_DATAGRAM_SIZE: usize = 16;
+
+/// The default `TimeoutConfig` for NAT-PMP requests.
+const TIMEOUT_CONFIG_DEFAULT: TimeoutConfig = TimeoutConfig {
+    initial_timeout: Duration::from_millis(FIRST_TIMEOUT_MILLIS),
+    max_retries: SANE_MAX_REQUEST_RETRIES,
+    max_retry_timeout: None,
+};
 
 /// Result codes from a NAT-PMP response.
 /// See <https://www.rfc-editor.org/rfc/rfc6886#section-3.5>
@@ -94,7 +102,10 @@ impl From<RequestSendError> for Failure {
 /// * `Timeout` if the gateway is not responding
 /// * `InvalidResponse` if the gateway gave an invalid response
 /// * `ResultCode` if the gateway gave a valid response, but it was an error. Will never return `ResultCode::Success` as an error.
-pub async fn try_external_address(gateway: IpAddr) -> Result<Ipv4Addr, Failure> {
+pub async fn try_external_address(
+    gateway: IpAddr,
+    timeout_config: Option<TimeoutConfig>,
+) -> Result<Ipv4Addr, Failure> {
     // Create a new UDP socket and connect to the gateway.
     let socket = helpers::new_socket(gateway)
         .await
@@ -104,8 +115,7 @@ pub async fn try_external_address(gateway: IpAddr) -> Result<Ipv4Addr, Failure> 
     let mut reader = bytes::BytesMut::with_capacity(MAX_DATAGRAM_SIZE);
     // Try to send the request data until a response is read, respecting the RFC recommended timeouts and retries counts.
     let n = helpers::try_send_until_response(
-        SANE_MAX_REQUEST_RETRIES,
-        Duration::from_millis(FIRST_TIMEOUT_MILLIS),
+        timeout_config.unwrap_or(TIMEOUT_CONFIG_DEFAULT),
         &socket,
         &[
             VersionCode::NatPmp as u8,
@@ -179,6 +189,7 @@ pub async fn try_port_mapping(
     internal_port: u16,
     external_port: Option<u16>,
     lifetime_seconds: Option<u32>,
+    timeout_config: Option<TimeoutConfig>,
 ) -> Result<PortMapping, Failure> {
     let socket = helpers::new_socket(gateway)
         .await
@@ -204,15 +215,10 @@ pub async fn try_port_mapping(
     // Split the byte buffer into a send buffer and a receive buffer.
     let send_buf = bb.split();
 
+    let timeout_config = timeout_config.unwrap_or(TIMEOUT_CONFIG_DEFAULT);
+
     // Try to send the request data until a response is read, respecting the RFC recommended timeouts and retries counts.
-    let n = helpers::try_send_until_response(
-        SANE_MAX_REQUEST_RETRIES,
-        Duration::from_millis(FIRST_TIMEOUT_MILLIS),
-        &socket,
-        &send_buf,
-        &mut bb,
-    )
-    .await?;
+    let n = helpers::try_send_until_response(timeout_config, &socket, &send_buf, &mut bb).await?;
 
     // A port mapping response is always expected to be 16 bytes.
     if n != 16 {
@@ -265,7 +271,9 @@ pub async fn try_port_mapping(
         internal_port,
         external_port,
         lifetime_seconds,
+        expiration: std::time::Instant::now() + Duration::from_secs(u64::from(lifetime_seconds)),
         mapping_type: PortMappingType::NatPmp,
+        timeout_config,
     })
 }
 
@@ -281,6 +289,7 @@ pub async fn try_drop_mapping(
     gateway: IpAddr,
     protocol: InternetProtocol,
     local_port: u16,
+    timeout_config: Option<TimeoutConfig>,
 ) -> Result<(), Failure> {
     // Mapping deletion is specified by the same operation code and format as mapping creation.
     // The difference is that the lifetime and external port must be set to `0`.
@@ -289,7 +298,15 @@ pub async fn try_drop_mapping(
         external_port,
         lifetime_seconds,
         ..
-    } = try_port_mapping(gateway, protocol, local_port, Some(0), Some(0)).await?;
+    } = try_port_mapping(
+        gateway,
+        protocol,
+        local_port,
+        Some(0),
+        Some(0),
+        timeout_config,
+    )
+    .await?;
 
     // Check that the response is correct for a deletion request.
     if internal_port != local_port || external_port != 0 || lifetime_seconds != 0 {

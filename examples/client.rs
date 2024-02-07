@@ -63,7 +63,7 @@ async fn main() {
 
     // If the external IP flag is set, attempt to get the external IP and exit.
     if args.external_ip {
-        let external_ip = match crab_nat::natpmp::try_external_address(gateway).await {
+        let external_ip = match crab_nat::natpmp::try_external_address(gateway, None).await {
             Ok(ip) => ip,
             Err(e) => return eprintln!("Failed to get external IP: {e:#}"),
         };
@@ -73,7 +73,7 @@ async fn main() {
     if args.delete {
         // Attempt a port unmapping request.
         if let Err(e) =
-            crab_nat::natpmp::try_drop_mapping(gateway, protocol, args.internal_port).await
+            crab_nat::natpmp::try_drop_mapping(gateway, protocol, args.internal_port, None).await
         {
             return eprintln!("Failed to unmap port: {e:#}");
         }
@@ -88,6 +88,7 @@ async fn main() {
             protocol,
             std::num::NonZeroU16::new(args.internal_port).expect("Invalid internal port"),
             args.external_port,
+            None,
             None,
         )
         .await

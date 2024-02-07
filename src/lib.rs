@@ -15,6 +15,7 @@
 //!         std::num::NonZeroU16::new(8080).unwrap() /* Internal port, cannot be zero */,
 //!         None /* External port, no preference */,
 //!         None /* Lifetime, use default of 2 hours */,
+//!         None /* Timing configuration, use defaults for each protocol */,
 //!     )
 //!     .await
 //!     {
@@ -75,6 +76,18 @@ pub enum PortMappingType {
     Pcp { client: IpAddr },
 }
 
+/// Configuration of the timing of UDP requests to the gateway.
+#[derive(Clone, Copy)]
+pub struct TimeoutConfig {
+    /// The initial timeout for the first request. In general, the timeout will be doubled on each successive retry.
+    pub initial_timeout: std::time::Duration,
+    /// The maximum number of retries to attempt before giving up.
+    /// Note that the first request is not considered a retry.
+    pub max_retries: usize,
+    /// The maximum timeout to use for a retry.
+    pub max_retry_timeout: Option<std::time::Duration>,
+}
+
 /// A port mapping on the gateway. Should be renewed with `.try_renew()` and deleted from the gateway with `.try_drop()`.
 pub struct PortMapping {
     /// The address of the gateway the mapping is registered with.
@@ -87,8 +100,12 @@ pub struct PortMapping {
     external_port: u16,
     /// The lifetime of the port mapping in seconds.
     lifetime_seconds: u32,
+    /// The datetime the port mapping is set to expire at.
+    expiration: std::time::Instant,
     /// The type of mapping protocol used, as well as any protocol specific parameters.
     mapping_type: PortMappingType,
+    /// The configuration of the timing of UDP requests made to the gateway.
+    pub timeout_config: TimeoutConfig,
 }
 impl PortMapping {
     /// Attempts to map a port on the gateway using PCP first and falling back to NAT-PMP.
@@ -107,6 +124,7 @@ impl PortMapping {
         internal_port: std::num::NonZeroU16,
         external_port: Option<u16>,
         lifetime_seconds: Option<u32>,
+        timeout_config: Option<TimeoutConfig>,
     ) -> Result<PortMapping, MappingFailure> {
         // Try to use the more modern protocol, PCP, first.
         match pcp::try_port_mapping(
@@ -116,6 +134,7 @@ impl PortMapping {
             internal_port.get(),
             external_port,
             lifetime_seconds.unwrap_or(natpmp::RECOMMENDED_MAPPING_LIFETIME_SECONDS),
+            timeout_config,
         )
         .await
         {
@@ -125,9 +144,16 @@ impl PortMapping {
         }
 
         // Fall back to the older, possibly more widely supported, NAT-PMP.
-        natpmp::try_port_mapping(gateway, protocol, internal_port.get(), external_port, None)
-            .await
-            .map_err(std::convert::Into::into)
+        natpmp::try_port_mapping(
+            gateway,
+            protocol,
+            internal_port.get(),
+            external_port,
+            None,
+            timeout_config,
+        )
+        .await
+        .map_err(std::convert::Into::into)
     }
 
     /// Attempts to renew this port mapping on the gateway, otherwise returns an error.
@@ -147,6 +173,7 @@ impl PortMapping {
                     self.internal_port,
                     Some(self.external_port),
                     Some(self.lifetime()),
+                    Some(self.timeout_config),
                 )
                 .await
                 .map_err(MappingFailure::from)?;
@@ -159,6 +186,7 @@ impl PortMapping {
                     self.internal_port,
                     Some(self.external_port),
                     self.lifetime(),
+                    Some(self.timeout_config),
                 )
                 .await
                 .map_err(MappingFailure::from)?;
@@ -182,14 +210,23 @@ impl PortMapping {
 
         // Attempt to delete the port mapping on the gateway.
         match mapping_type {
-            PortMappingType::NatPmp => natpmp::try_drop_mapping(gateway, protocol, internal_port)
-                .await
-                .map_err(|e| (MappingFailure::from(e), self)),
-            PortMappingType::Pcp { client } => {
-                pcp::try_drop_mapping(gateway, client, protocol, internal_port)
-                    .await
-                    .map_err(|e| (MappingFailure::from(e), self))
-            }
+            PortMappingType::NatPmp => natpmp::try_drop_mapping(
+                self.gateway(),
+                self.protocol(),
+                internal_port,
+                Some(self.timeout_config),
+            )
+            .await
+            .map_err(|e| (MappingFailure::from(e), self)),
+            PortMappingType::Pcp { client } => pcp::try_drop_mapping(
+                gateway,
+                client,
+                protocol,
+                internal_port,
+                Some(self.timeout_config),
+            )
+            .await
+            .map_err(|e| (MappingFailure::from(e), self)),
         }
     }
 
@@ -214,6 +251,10 @@ impl PortMapping {
         self.lifetime_seconds
     }
     #[must_use]
+    pub fn expiration(&self) -> std::time::Instant {
+        self.expiration
+    }
+    #[must_use]
     pub fn mapping_type(&self) -> PortMappingType {
         self.mapping_type
     }
@@ -224,6 +265,8 @@ mod helpers {
     use std::time::Duration;
 
     use tokio::net::UdpSocket;
+
+    use crate::TimeoutConfig;
 
     /// Create a new UDP socket and connect it to the gateway socket address for NAT-PMP or PCP.
     /// # Errors
@@ -258,8 +301,7 @@ mod helpers {
     /// * Failed to receive data on the socket
     /// Otherwise, will return a `Timeout` error if the gateway could not be reached after all retries.
     pub async fn try_send_until_response(
-        max_retries: usize,
-        initial_timeout: Duration,
+        timeout_config: TimeoutConfig,
         socket: &UdpSocket,
         send_bytes: &[u8],
         recv_buf: &mut bytes::BytesMut,
@@ -283,7 +325,7 @@ mod helpers {
         }
 
         // Use the RFC recommended initial timeout and double it on each successive failure.
-        let mut wait = initial_timeout;
+        let mut wait = timeout_config.initial_timeout;
         let mut retries = 0;
         loop {
             match send_and_recv(socket, send_bytes, recv_buf, wait).await {
@@ -292,7 +334,7 @@ mod helpers {
 
                 // Retry on timeout up to `max_retries` times.
                 Err(RequestSendError::Timeout) => {
-                    if retries >= max_retries {
+                    if retries >= timeout_config.max_retries {
                         return Err(RequestSendError::Timeout);
                     }
                     retries += 1;
@@ -301,8 +343,18 @@ mod helpers {
                     // TODO: PCP Requires a random value in [0.9, 1.1] be multiplied by the timeout.
                     wait += wait;
 
+                    // Limit the timeout to the configured maximum.
+                    if let Some(max) = timeout_config.max_retry_timeout {
+                        if wait > max {
+                            wait = max;
+                        }
+                    }
+
                     #[cfg(debug_assertions)]
-                    println!("DEBUG Starting retry {retries}/{max_retries} with timeout {wait:?}");
+                    println!(
+                        "DEBUG Starting retry {retries}/{} with timeout {wait:?}",
+                        timeout_config.max_retries
+                    );
                 }
 
                 // Any other error is returned immediately.

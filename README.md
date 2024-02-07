@@ -15,6 +15,7 @@ let mapping = match crab_nat::PortMapping::new(
     std::num::NonZeroU16::new(8080).unwrap() /* Internal port, cannot be zero */,
     None /* External port, no preference */,
     None /* Lifetime, use default of 2 hours */,
+    None /* Timing configuration, use defaults for each protocol */,
 )
 .await
 {
@@ -32,11 +33,14 @@ if let Err((e, m)) = mapping.try_drop().await {
 }
 ```
 
-Crab NAT does not determine the gateway address or the local client address itself. I recommend using [default-net](https://crates.io/crates/default-net), see the example [client](examples/client.rs) for basic usage.
+Crab NAT does not determine the gateway address or the local client address. This is to reduce unnecessary assumptions about how this library will be used. For an easy API to determine these values reliably, I recommend using [default-net](https://crates.io/crates/default-net); see the example [client](examples/client.rs) for basic usage.
 
 ### Missing Features
-* PCP describes a `Peer` operation which is not yet implemented.
-* PCP describes an `Announce` operation, which I don't plan to implement.
-* PCP supports more protocols than just UDP and TCP which are not yet added. I'm open to supporting more protocols if they are requested.
-* PCP defines a number of "Options" which are not implemented. There is currently no plan to implement them.
-* https://www.rfc-editor.org/rfc/rfc6886#section-3.2.1 states that NAT-PMP clients should listen for external IP address changes from the gateway. This is not currently implemented, and I am unsure how useful this would be.
+* NAT-PMP:
+  * https://www.rfc-editor.org/rfc/rfc6886#section-3.2.1 states that NAT-PMP clients should listen for external IP address changes from the gateway. This is not currently implemented, and I am unsure how useful this would be.
+* PCP:
+  * https://www.rfc-editor.org/rfc/rfc6887#section-8.1.1 describes more complex request timing configurations than are currently implemented.
+  * PCP describes a `Peer` operation which is not yet implemented.
+  * PCP describes an `Announce` operation, which I don't plan to implement.
+  * PCP supports more protocols than just UDP and TCP which are not yet added. I'm open to supporting more protocols if they are requested.
+  * PCP defines a number of "Options" which are not implemented. There is currently no plan to implement them.

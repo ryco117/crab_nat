@@ -7,17 +7,27 @@ use bytes::{Buf as _, BufMut as _, BytesMut};
 
 use crate::{
     helpers::{self, RequestSendError},
-    InternetProtocol, PortMapping, PortMappingType, VersionCode, SANE_MAX_REQUEST_RETRIES,
+    InternetProtocol, PortMapping, PortMappingType, TimeoutConfig, VersionCode,
+    SANE_MAX_REQUEST_RETRIES,
 };
 
 /// The RFC states that the first response timeout "SHOULD be 3 seconds."
 /// <https://www.rfc-editor.org/rfc/rfc6887#section-8.1.1>
-pub const FIRST_TIMEOUT_SECONDS: u32 = 3;
+pub const FIRST_TIMEOUT_SECONDS: u64 = 3;
 
-pub const MAX_TIMEOUT_SECONDS: u32 = 1024;
+/// The RFC states that the maximum response timeout "SHOULD be 1024 seconds."
+/// <https://www.rfc-editor.org/rfc/rfc6887#section-8.1.1>
+pub const MAX_TIMEOUT_SECONDS: u64 = 1024;
 
 /// PCP has a maximum size of 1100 bytes, see <https://www.rfc-editor.org/rfc/rfc6887#section-7>.
 pub const MAX_DATAGRAM_SIZE: usize = 1100;
+
+/// The default `TimeoutConfig` for PCP requests.
+const TIMEOUT_CONFIG_DEFAULT: TimeoutConfig = TimeoutConfig {
+    initial_timeout: Duration::from_secs(FIRST_TIMEOUT_SECONDS),
+    max_retries: SANE_MAX_REQUEST_RETRIES,
+    max_retry_timeout: Some(Duration::from_secs(MAX_TIMEOUT_SECONDS)),
+};
 
 /// Valid result codes from a PCP response.
 /// See <https://www.rfc-editor.org/rfc/rfc6887#section-7.4>
@@ -122,7 +132,9 @@ pub async fn try_port_mapping(
     internal_port: u16,
     req_external_port: Option<u16>,
     lifetime_seconds: u32,
+    timeout_config: Option<TimeoutConfig>,
 ) -> Result<PortMapping, Failure> {
+    let timeout_config = timeout_config.unwrap_or(TIMEOUT_CONFIG_DEFAULT);
     let PcpResponse { n, mut bb, nonce } = try_send_map_request(
         gateway,
         client,
@@ -130,6 +142,7 @@ pub async fn try_port_mapping(
         internal_port,
         req_external_port,
         lifetime_seconds,
+        timeout_config,
     )
     .await?;
 
@@ -234,7 +247,9 @@ pub async fn try_port_mapping(
         internal_port,
         external_port,
         lifetime_seconds,
+        expiration: std::time::Instant::now() + Duration::from_secs(u64::from(lifetime_seconds)),
         mapping_type: PortMappingType::Pcp { client },
+        timeout_config,
     })
 }
 
@@ -251,6 +266,7 @@ pub async fn try_drop_mapping(
     client: IpAddr,
     protocol: InternetProtocol,
     local_port: u16,
+    timeout_config: Option<TimeoutConfig>,
 ) -> Result<(), Failure> {
     // Mapping deletion is specified by the same operation code and format as mapping creation.
     // The difference is that the lifetime and external port must be set to `0`.
@@ -259,7 +275,16 @@ pub async fn try_drop_mapping(
         external_port,
         lifetime_seconds,
         ..
-    } = try_port_mapping(gateway, client, protocol, local_port, Some(0), 0).await?;
+    } = try_port_mapping(
+        gateway,
+        client,
+        protocol,
+        local_port,
+        Some(0),
+        0,
+        timeout_config,
+    )
+    .await?;
 
     // Check that the response is correct for a deletion request.
     if internal_port != local_port || external_port != 0 || lifetime_seconds != 0 {
@@ -289,6 +314,7 @@ async fn try_send_map_request(
     internal_port: u16,
     req_external_port: Option<u16>,
     lifetime_seconds: u32,
+    timeout_config: TimeoutConfig,
 ) -> Result<PcpResponse, Failure> {
     let socket = helpers::new_socket(gateway)
         .await
@@ -327,15 +353,9 @@ async fn try_send_map_request(
     let request = bb.split();
 
     // https://www.rfc-editor.org/rfc/rfc6887#section-8.1.1 TODO: Expands on PCP timing in detail. Requires randomized timeouts.
-    let n = helpers::try_send_until_response(
-        SANE_MAX_REQUEST_RETRIES,
-        Duration::from_secs(u64::from(FIRST_TIMEOUT_SECONDS)),
-        &socket,
-        &request,
-        &mut bb,
-    )
-    .await
-    .map_err(Failure::from)?;
+    let n = helpers::try_send_until_response(timeout_config, &socket, &request, &mut bb)
+        .await
+        .map_err(Failure::from)?;
 
     Ok(PcpResponse { n, bb, nonce })
 }

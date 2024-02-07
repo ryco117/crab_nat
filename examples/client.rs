@@ -24,8 +24,8 @@ struct Cli {
     #[arg(short = 'x', long)]
     external_ip: bool,
 
-    /// The protocol to map. Defaults to TCP.
-    #[arg(short, long)]
+    /// The protocol to map.
+    #[arg(short, long, default_value = "tcp")]
     internet_protocol: String,
 }
 
@@ -37,9 +37,8 @@ async fn main() {
     // Get the protocol from the command line or use the default.
     let protocol = match args.internet_protocol.to_lowercase().as_str().trim() {
         "udp" => crab_nat::InternetProtocol::Udp,
-
-        // Default to TCP.
-        _ => crab_nat::InternetProtocol::Tcp,
+        "tcp" => crab_nat::InternetProtocol::Tcp,
+        _ => panic!("Invalid protocol"),
     };
 
     // Get the gateway address from the command line or guess the default.

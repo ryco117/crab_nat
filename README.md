@@ -37,5 +37,6 @@ Crab NAT does not determine the gateway address or the local client address itse
 ### Missing Features
 * PCP describes a `Peer` operation which is not yet implemented.
 * PCP describes an `Announce` operation, which I don't plan to implement.
-* PCP defines a number of protocol options which are not implemented. There is currently no plan to implement them.
+* PCP supports more protocols than just UDP and TCP which are not yet added. I'm open to supporting more protocols if they are requested.
+* PCP defines a number of "Options" which are not implemented. There is currently no plan to implement them.
 * https://www.rfc-editor.org/rfc/rfc6886#section-3.2.1 states that NAT-PMP clients should listen for external IP address changes from the gateway. This is not currently implemented, and I am unsure how useful this would be.

@@ -23,12 +23,24 @@ struct Cli {
     /// Fetch the external IP address through NAT-PMP and exit.
     #[arg(short = 'x', long)]
     external_ip: bool,
+
+    /// The protocol to map. Defaults to TCP.
+    #[arg(short, long)]
+    internet_protocol: String,
 }
 
 #[tokio::main]
 async fn main() {
     use clap::Parser as _;
     let args = Cli::parse();
+
+    // Get the protocol from the command line or use the default.
+    let protocol = match args.internet_protocol.to_lowercase().as_str().trim() {
+        "udp" => crab_nat::InternetProtocol::Udp,
+
+        // Default to TCP.
+        _ => crab_nat::InternetProtocol::Tcp,
+    };
 
     // Get the gateway address from the command line or guess the default.
     let gateway = if args.gateway.is_empty() {
@@ -60,12 +72,8 @@ async fn main() {
 
     if args.delete {
         // Attempt a port unmapping request.
-        if let Err(e) = crab_nat::natpmp::try_drop_mapping(
-            gateway,
-            crab_nat::InternetProtocol::Tcp,
-            args.internal_port,
-        )
-        .await
+        if let Err(e) =
+            crab_nat::natpmp::try_drop_mapping(gateway, protocol, args.internal_port).await
         {
             return eprintln!("Failed to unmap port: {e:#}");
         }
@@ -77,7 +85,7 @@ async fn main() {
         let mapping = match crab_nat::PortMapping::new(
             gateway,
             local_address,
-            crab_nat::InternetProtocol::Tcp,
+            protocol,
             std::num::NonZeroU16::new(args.internal_port).expect("Invalid internal port"),
             args.external_port,
             None,

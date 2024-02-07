@@ -3,7 +3,7 @@ use std::{
     time::Duration,
 };
 
-use bytes::{Buf as _, BufMut as _};
+use bytes::{Buf as _, BufMut as _, BytesMut};
 
 use crate::{
     helpers::{self, RequestSendError},
@@ -123,52 +123,15 @@ pub async fn try_port_mapping(
     req_external_port: Option<u16>,
     lifetime_seconds: u32,
 ) -> Result<PortMapping, Failure> {
-    let socket = helpers::new_socket(gateway)
-        .await
-        .map_err(Failure::Socket)?;
-
-    // PCP addresses are always specified as 128 bit addresses, <https://www.rfc-editor.org/rfc/rfc6887#section-5>.
-    // We need to map `Ipv4Addr` accoriding to RFC4291 <https://www.rfc-editor.org/rfc/rfc4291>.
-    let (client_ip6_bytes, zero_addr_ip6_bytes) = match client {
-        IpAddr::V4(v4) => (v4.to_ipv6_mapped(), Ipv4Addr::UNSPECIFIED.to_ipv6_mapped()),
-        IpAddr::V6(v6) => (v6, Ipv6Addr::UNSPECIFIED),
-    };
-
-    let mut bb = bytes::BytesMut::with_capacity(MAX_DATAGRAM_SIZE << 1);
-
-    // Create the common PCP request header.
-    bb.put_u8(VersionCode::Pcp as u8);
-    bb.put_u8(opcode_to_request(OperationCode::Map));
-    bb.put_u16(0); // Reserved.
-    bb.put_u32(lifetime_seconds);
-    bb.put(&client_ip6_bytes.octets()[..]);
-
-    // Generate 96 random bits for the nonce.
-    let nonce: [u32; 3] = [rand::random(), rand::random(), rand::random()];
-
-    // Create the mapping specific request.
-    bb.put_u32(nonce[0]);
-    bb.put_u32(nonce[1]);
-    bb.put_u32(nonce[2]);
-    bb.put_u8(protocol_to_byte(protocol));
-    bb.put(&[0u8; 3][..]); // Reserved.
-    bb.put_u16(internal_port);
-    bb.put_u16(req_external_port.unwrap_or_default());
-    bb.put(&zero_addr_ip6_bytes.octets()[..]); // No preference on external address.
-
-    // Send the request to the gateway.
-    let request = bb.split();
-
-    // https://www.rfc-editor.org/rfc/rfc6887#section-8.1.1 TODO: Expands on PCP timing in detail.
-    let n = helpers::try_send_until_response(
-        SANE_MAX_REQUEST_RETRIES,
-        Duration::from_secs(u64::from(FIRST_TIMEOUT_SECONDS)),
-        &socket,
-        &request,
-        &mut bb,
+    let PcpResponse { n, mut bb, nonce } = try_send_map_request(
+        gateway,
+        client,
+        protocol,
+        internal_port,
+        req_external_port,
+        lifetime_seconds,
     )
-    .await
-    .map_err(Failure::from)?;
+    .await?;
 
     // All valid PCP responses have at least 24 bytes, see <https://www.rfc-editor.org/rfc/rfc6887#section-7.2>.
     if n < 24 {
@@ -306,6 +269,75 @@ pub async fn try_drop_mapping(
     }
 
     Ok(())
+}
+
+/// Helper object to store the response from a PCP request, including the session nonce.
+struct PcpResponse {
+    /// The number of bytes in the response.
+    pub n: usize,
+    /// Bytestream containing the response. Only the first `n` bytes are valid.
+    pub bb: BytesMut,
+    /// The nonce from the request.
+    pub nonce: [u32; 3],
+}
+
+/// Helper function to try to create and send a PCP request and return the gateway's response, if any.
+async fn try_send_map_request(
+    gateway: IpAddr,
+    client: IpAddr,
+    protocol: InternetProtocol,
+    internal_port: u16,
+    req_external_port: Option<u16>,
+    lifetime_seconds: u32,
+) -> Result<PcpResponse, Failure> {
+    let socket = helpers::new_socket(gateway)
+        .await
+        .map_err(Failure::Socket)?;
+
+    // PCP addresses are always specified as 128 bit addresses, <https://www.rfc-editor.org/rfc/rfc6887#section-5>.
+    // We need to map `Ipv4Addr` accoriding to RFC4291 <https://www.rfc-editor.org/rfc/rfc4291>.
+    let (client_ip6_bytes, zero_addr_ip6_bytes) = match client {
+        IpAddr::V4(v4) => (v4.to_ipv6_mapped(), Ipv4Addr::UNSPECIFIED.to_ipv6_mapped()),
+        IpAddr::V6(v6) => (v6, Ipv6Addr::UNSPECIFIED),
+    };
+
+    let mut bb = bytes::BytesMut::with_capacity(MAX_DATAGRAM_SIZE << 1);
+
+    // Create the common PCP request header.
+    bb.put_u8(VersionCode::Pcp as u8);
+    bb.put_u8(opcode_to_request(OperationCode::Map));
+    bb.put_u16(0); // Reserved.
+    bb.put_u32(lifetime_seconds);
+    bb.put(&client_ip6_bytes.octets()[..]);
+
+    // Generate 96 random bits for the nonce.
+    let nonce: [u32; 3] = [rand::random(), rand::random(), rand::random()];
+
+    // Create the mapping specific request.
+    bb.put_u32(nonce[0]);
+    bb.put_u32(nonce[1]);
+    bb.put_u32(nonce[2]);
+    bb.put_u8(protocol_to_byte(protocol));
+    bb.put(&[0u8; 3][..]); // Reserved.
+    bb.put_u16(internal_port);
+    bb.put_u16(req_external_port.unwrap_or_default());
+    bb.put(&zero_addr_ip6_bytes.octets()[..]); // No preference on external address.
+
+    // Send the request to the gateway.
+    let request = bb.split();
+
+    // https://www.rfc-editor.org/rfc/rfc6887#section-8.1.1 TODO: Expands on PCP timing in detail. Requires randomized timeouts.
+    let n = helpers::try_send_until_response(
+        SANE_MAX_REQUEST_RETRIES,
+        Duration::from_secs(u64::from(FIRST_TIMEOUT_SECONDS)),
+        &socket,
+        &request,
+        &mut bb,
+    )
+    .await
+    .map_err(Failure::from)?;
+
+    Ok(PcpResponse { n, bb, nonce })
 }
 
 /// Request `OperationCode` bits are the same as the abstract `OperationCode`s, but left shifted by one.

@@ -96,20 +96,19 @@ async fn main() {
             Ok(m) => m,
             Err(e) => return eprintln!("Failed to map port: {e:#}"),
         };
-        let protocol = mapping.mapping_type();
+        let protocol = mapping.protocol();
         let external_port = mapping.external_port();
         let internal_port = mapping.internal_port();
         let lifetime = mapping.lifetime();
         let mapping_type = mapping.mapping_type();
 
         // Print the mapped port information.
-        println!("Successfully mapped protocol {protocol:?} on external port {external_port} to internal port {internal_port} with a lifetime of {lifetime:?} using version {mapping_type:?}");
+        println!("Successfully mapped protocol {protocol:?} on external port {external_port} to internal port {internal_port} with a lifetime of {lifetime:?} using {mapping_type:?}");
 
         // Try to safely drop the mapping.
         if let Err((e, m)) = mapping.try_drop().await {
             eprintln!(
-                "Failed to drop mapping {}:{}->{}: {e:?}",
-                m.gateway(),
+                "Failed to drop mapping {protocol:?} {gateway}:{}->{}: {e:?}",
                 m.external_port(),
                 m.internal_port()
             );

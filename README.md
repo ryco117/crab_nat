@@ -13,9 +13,7 @@ let mapping = match crab_nat::PortMapping::new(
     local_address /* Address of our client, as seen by the gateway. Only used by PCP */,
     crab_nat::InternetProtocol::Tcp /* Protocol to map */,
     std::num::NonZeroU16::new(8080).unwrap() /* Internal port, cannot be zero */,
-    None /* External port, no preference */,
-    None /* Lifetime, use default of 2 hours */,
-    None /* Timing configuration, use defaults for each protocol */,
+    PortMappingOptions::Default() /* Optional configuration values, including suggested external port and lifetimes */,
 )
 .await
 {

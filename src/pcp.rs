@@ -7,8 +7,8 @@ use bytes::{Buf as _, BufMut as _, BytesMut};
 
 use crate::{
     helpers::{self, RequestSendError},
-    InternetProtocol, PortMapping, PortMappingType, TimeoutConfig, VersionCode,
-    SANE_MAX_REQUEST_RETRIES,
+    InternetProtocol, PortMapping, PortMappingOptions, PortMappingType, TimeoutConfig, VersionCode,
+    RECOMMENDED_MAPPING_LIFETIME_SECONDS, SANE_MAX_REQUEST_RETRIES,
 };
 
 /// The RFC states that the first response timeout "SHOULD be 3 seconds."
@@ -130,18 +130,20 @@ pub async fn try_port_mapping(
     client: IpAddr,
     protocol: InternetProtocol,
     internal_port: u16,
-    req_external_port: Option<u16>,
-    lifetime_seconds: u32,
-    timeout_config: Option<TimeoutConfig>,
+    mapping_options: PortMappingOptions,
 ) -> Result<PortMapping, Failure> {
-    let timeout_config = timeout_config.unwrap_or(TIMEOUT_CONFIG_DEFAULT);
+    let timeout_config = mapping_options
+        .timeout_config
+        .unwrap_or(TIMEOUT_CONFIG_DEFAULT);
     let PcpResponse { n, mut bb, nonce } = try_send_map_request(
         gateway,
         client,
         protocol,
         internal_port,
-        req_external_port,
-        lifetime_seconds,
+        mapping_options.external_port,
+        mapping_options
+            .lifetime_seconds
+            .unwrap_or(RECOMMENDED_MAPPING_LIFETIME_SECONDS),
         timeout_config,
     )
     .await?;
@@ -280,9 +282,11 @@ pub async fn try_drop_mapping(
         client,
         protocol,
         local_port,
-        Some(0),
-        0,
-        timeout_config,
+        PortMappingOptions {
+            external_port: Some(0),
+            lifetime_seconds: Some(0),
+            timeout_config,
+        },
     )
     .await?;
 

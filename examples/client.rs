@@ -1,3 +1,5 @@
+use crab_nat::PortMappingOptions;
+
 #[derive(clap::Parser)]
 struct Cli {
     /// Delete the port mapping instead of creating one.
@@ -86,9 +88,10 @@ async fn main() {
             local_address,
             protocol,
             std::num::NonZeroU16::new(args.internal_port).expect("Invalid internal port"),
-            args.external_port,
-            None,
-            None,
+            PortMappingOptions {
+                external_port: args.external_port,
+                ..Default::default()
+            },
         )
         .await
         {

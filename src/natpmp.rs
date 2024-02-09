@@ -8,12 +8,9 @@ use num_enum::TryFromPrimitive;
 
 use crate::{
     helpers::{self, RequestSendError},
-    InternetProtocol, PortMapping, PortMappingType, TimeoutConfig, VersionCode,
-    SANE_MAX_REQUEST_RETRIES,
+    InternetProtocol, PortMapping, PortMappingOptions, PortMappingType, TimeoutConfig, VersionCode,
+    RECOMMENDED_MAPPING_LIFETIME_SECONDS, SANE_MAX_REQUEST_RETRIES,
 };
-
-/// The RFC recommended lifetime for a port mapping.
-pub const RECOMMENDED_MAPPING_LIFETIME_SECONDS: u32 = 7200;
 
 /// The RFC states that the first response timeout SHOULD be 250 milliseconds, and double on each successive failure.
 pub const FIRST_TIMEOUT_MILLIS: u64 = 250;
@@ -187,9 +184,7 @@ pub async fn try_port_mapping(
     gateway: IpAddr,
     protocol: InternetProtocol,
     internal_port: u16,
-    external_port: Option<u16>,
-    lifetime_seconds: Option<u32>,
-    timeout_config: Option<TimeoutConfig>,
+    mapping_options: PortMappingOptions,
 ) -> Result<PortMapping, Failure> {
     let socket = helpers::new_socket(gateway)
         .await
@@ -209,13 +204,19 @@ pub async fn try_port_mapping(
     bb.put_u8(req_op as u8);
     bb.put_u16(0); // Reserved.
     bb.put_u16(internal_port);
-    bb.put_u16(external_port.unwrap_or_default());
-    bb.put_u32(lifetime_seconds.unwrap_or(RECOMMENDED_MAPPING_LIFETIME_SECONDS));
+    bb.put_u16(mapping_options.external_port.unwrap_or_default());
+    bb.put_u32(
+        mapping_options
+            .lifetime_seconds
+            .unwrap_or(RECOMMENDED_MAPPING_LIFETIME_SECONDS),
+    );
 
     // Split the byte buffer into a send buffer and a receive buffer.
     let send_buf = bb.split();
 
-    let timeout_config = timeout_config.unwrap_or(TIMEOUT_CONFIG_DEFAULT);
+    let timeout_config = mapping_options
+        .timeout_config
+        .unwrap_or(TIMEOUT_CONFIG_DEFAULT);
 
     // Try to send the request data until a response is read, respecting the RFC recommended timeouts and retries counts.
     let n = helpers::try_send_until_response(timeout_config, &socket, &send_buf, &mut bb).await?;
@@ -302,9 +303,11 @@ pub async fn try_drop_mapping(
         gateway,
         protocol,
         local_port,
-        Some(0),
-        Some(0),
-        timeout_config,
+        PortMappingOptions {
+            external_port: Some(0),
+            lifetime_seconds: Some(0),
+            timeout_config,
+        },
     )
     .await?;
 

@@ -1,3 +1,5 @@
+use std::num::NonZeroU16;
+
 use crab_nat::PortMappingOptions;
 
 #[derive(clap::Parser)]
@@ -87,9 +89,9 @@ async fn main() {
             gateway,
             local_address,
             protocol,
-            std::num::NonZeroU16::new(args.internal_port).expect("Invalid internal port"),
+            NonZeroU16::new(args.internal_port).expect("Invalid internal port"),
             PortMappingOptions {
-                external_port: args.external_port,
+                external_port: args.external_port.map(NonZeroU16::new).flatten(),
                 ..Default::default()
             },
         )

@@ -1,5 +1,6 @@
 use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    num::NonZeroU16,
     time::Duration,
 };
 
@@ -28,6 +29,8 @@ const TIMEOUT_CONFIG_DEFAULT: TimeoutConfig = TimeoutConfig {
     max_retries: SANE_MAX_REQUEST_RETRIES,
     max_retry_timeout: Some(Duration::from_secs(MAX_TIMEOUT_SECONDS)),
 };
+
+pub type Nonce = [u32; 3];
 
 /// Valid result codes from a PCP response.
 /// See <https://www.rfc-editor.org/rfc/rfc6887#section-7.4>
@@ -125,21 +128,33 @@ impl From<RequestSendError> for Failure {
 /// * `Timeout` if the gateway is not responding
 /// * `InvalidResponse` if the gateway gave an invalid response
 /// * `ResultCode` if the gateway gave a valid response, but it was an error. Will never return `ResultCode::Success` as an error.
+/// Also, if the given `internal_port` is `0` and the `lifetime_seconds` is not `Some(0)`, will return `ResultCode::MalformedRequest`.
 pub async fn try_port_mapping(
     gateway: IpAddr,
     client: IpAddr,
     protocol: InternetProtocol,
     internal_port: u16,
+    session_nonce: Option<Nonce>,
     mapping_options: PortMappingOptions,
 ) -> Result<PortMapping, Failure> {
     let timeout_config = mapping_options
         .timeout_config
         .unwrap_or(TIMEOUT_CONFIG_DEFAULT);
-    let PcpResponse { n, mut bb, nonce } = try_send_map_request(
+
+    // Ensure that a local port of `0` is only used for deletion requests.
+    if internal_port == 0 && !mapping_options.lifetime_seconds.is_some_and(|l| l == 0) {
+        return Err(Failure::ResultCode(ResultCode::MalformedRequest));
+    }
+
+    // Use an existing session nonce or generate 96 new random bits.
+    let nonce: Nonce = session_nonce.unwrap_or_else(|| [rand::random(), rand::random(), rand::random()]);
+
+    let PcpResponse { n, mut bb } = try_send_map_request(
         gateway,
         client,
         protocol,
         internal_port,
+        nonce,
         mapping_options.external_port,
         mapping_options
             .lifetime_seconds
@@ -148,7 +163,7 @@ pub async fn try_port_mapping(
     )
     .await?;
 
-    // All valid PCP responses have at least 24 bytes, see <https://www.rfc-editor.org/rfc/rfc6887#section-7.2>.
+    // All valid PCP responses have at least 24 bytes, see <https://www.rfc-editor.org/rfc/rfc6887#section-8.3>, page 26.
     if n < 24 {
         let bits = &bb[..n];
 
@@ -225,16 +240,7 @@ pub async fn try_port_mapping(
     let external_port = bb.get_u16();
 
     // The external IP address assigned to our mapping.
-    let external_ip = Ipv6Addr::new(
-        bb.get_u16(),
-        bb.get_u16(),
-        bb.get_u16(),
-        bb.get_u16(),
-        bb.get_u16(),
-        bb.get_u16(),
-        bb.get_u16(),
-        bb.get_u16(),
-    );
+    let external_ip = read_ip6_addr(&mut bb);
     let external_ip = if let Some(ip) = external_ip.to_ipv4_mapped() {
         IpAddr::V4(ip)
     } else {
@@ -250,7 +256,7 @@ pub async fn try_port_mapping(
         external_port,
         lifetime_seconds,
         expiration: std::time::Instant::now() + Duration::from_secs(u64::from(lifetime_seconds)),
-        mapping_type: PortMappingType::Pcp { client },
+        mapping_type: PortMappingType::Pcp { client, nonce },
         timeout_config,
     })
 }
@@ -268,6 +274,7 @@ pub async fn try_drop_mapping(
     client: IpAddr,
     protocol: InternetProtocol,
     local_port: u16,
+    nonce: Nonce,
     timeout_config: Option<TimeoutConfig>,
 ) -> Result<(), Failure> {
     // Mapping deletion is specified by the same operation code and format as mapping creation.
@@ -282,8 +289,9 @@ pub async fn try_drop_mapping(
         client,
         protocol,
         local_port,
+        Some(nonce),
         PortMappingOptions {
-            external_port: Some(0),
+            external_port: None,
             lifetime_seconds: Some(0),
             timeout_config,
         },
@@ -306,8 +314,6 @@ struct PcpResponse {
     pub n: usize,
     /// Bytestream containing the response. Only the first `n` bytes are valid.
     pub bb: BytesMut,
-    /// The nonce from the request.
-    pub nonce: [u32; 3],
 }
 
 /// Helper function to try to create and send a PCP request and return the gateway's response, if any.
@@ -316,7 +322,8 @@ async fn try_send_map_request(
     client: IpAddr,
     protocol: InternetProtocol,
     internal_port: u16,
-    req_external_port: Option<u16>,
+    nonce: Nonce,
+    req_external_port: Option<NonZeroU16>,
     lifetime_seconds: u32,
     timeout_config: TimeoutConfig,
 ) -> Result<PcpResponse, Failure> {
@@ -340,9 +347,6 @@ async fn try_send_map_request(
     bb.put_u32(lifetime_seconds);
     bb.put(&client_ip6_bytes.octets()[..]);
 
-    // Generate 96 random bits for the nonce.
-    let nonce: [u32; 3] = [rand::random(), rand::random(), rand::random()];
-
     // Create the mapping specific request.
     bb.put_u32(nonce[0]);
     bb.put_u32(nonce[1]);
@@ -350,18 +354,18 @@ async fn try_send_map_request(
     bb.put_u8(protocol_to_byte(protocol));
     bb.put(&[0u8; 3][..]); // Reserved.
     bb.put_u16(internal_port);
-    bb.put_u16(req_external_port.unwrap_or_default());
+    bb.put_u16(req_external_port.map_or(0, NonZeroU16::get));
     bb.put(&zero_addr_ip6_bytes.octets()[..]); // No preference on external address.
 
     // Send the request to the gateway.
     let request = bb.split();
 
-    // https://www.rfc-editor.org/rfc/rfc6887#section-8.1.1 TODO: Expands on PCP timing in detail. Requires randomized timeouts.
+    // <https://www.rfc-editor.org/rfc/rfc6887#section-8.1.1> TODO: Expands on PCP timing in detail. Requires randomized timeouts.
     let n = helpers::try_send_until_response(timeout_config, &socket, &request, &mut bb)
         .await
         .map_err(Failure::from)?;
 
-    Ok(PcpResponse { n, bb, nonce })
+    Ok(PcpResponse { n, bb })
 }
 
 /// Request `OperationCode` bits are the same as the abstract `OperationCode`s, but left shifted by one.
@@ -385,4 +389,20 @@ fn protocol_to_byte(protocol: InternetProtocol) -> u8 {
         InternetProtocol::Tcp => 6,
         InternetProtocol::Udp => 17,
     }
+}
+
+/// Read an `Ipv6Addr` from the given `BytesMut`.
+/// # Panics
+/// This function panics if there is not enough remaining data in self to read the `Ipv6Addr`.
+fn read_ip6_addr(bb: &mut bytes::BytesMut) -> Ipv6Addr {
+    Ipv6Addr::new(
+        bb.get_u16(),
+        bb.get_u16(),
+        bb.get_u16(),
+        bb.get_u16(),
+        bb.get_u16(),
+        bb.get_u16(),
+        bb.get_u16(),
+        bb.get_u16(),
+    )
 }

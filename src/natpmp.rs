@@ -204,7 +204,11 @@ pub async fn try_port_mapping(
     bb.put_u8(req_op as u8);
     bb.put_u16(0); // Reserved.
     bb.put_u16(internal_port);
-    bb.put_u16(mapping_options.external_port.unwrap_or_default());
+    bb.put_u16(
+        mapping_options
+            .external_port
+            .map_or(0, std::num::NonZeroU16::get),
+    );
     bb.put_u32(
         mapping_options
             .lifetime_seconds
@@ -262,7 +266,13 @@ pub async fn try_port_mapping(
     }
 
     // The response was a success, read the mapping information.
-    let internal_port = bb.get_u16();
+    let response_internal_port = bb.get_u16();
+    if response_internal_port != internal_port {
+        return Err(Failure::InvalidResponse(format!(
+            "Incorrect internal port: {response_internal_port}, expected {internal_port}"
+        )));
+    }
+
     let external_port = bb.get_u16();
     let lifetime_seconds = bb.get_u32();
 
@@ -304,7 +314,7 @@ pub async fn try_drop_mapping(
         protocol,
         local_port,
         PortMappingOptions {
-            external_port: Some(0),
+            external_port: None,
             lifetime_seconds: Some(0),
             timeout_config,
         },

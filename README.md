@@ -9,11 +9,11 @@ If there isn't a preference on which protocol is used or what the external port 
 ```rust
 // Attempt a port mapping request through PCP first and fallback to NAT-PMP.
 let mapping = match crab_nat::PortMapping::new(
-    gateway /* Address of the PCP server, often a gateway or firewall */,
-    local_address /* Address of our client, as seen by the gateway. Only used by PCP */,
-    crab_nat::InternetProtocol::Tcp /* Protocol to map */,
-    std::num::NonZeroU16::new(8080).unwrap() /* Internal port, cannot be zero */,
-    PortMappingOptions::Default() /* Optional configuration values, including suggested external port and lifetimes */,
+    gateway, /* Address of the PCP server, often a gateway or firewall */
+    local_address, /* Address of our client, as seen by the gateway. Only used by PCP */
+    crab_nat::InternetProtocol::Tcp, /* Protocol to map */
+    std::num::NonZeroU16::new(8080).unwrap(), /* Internal port, cannot be zero */
+    crab_nat::PortMappingOptions::default(), /* Optional configuration values, including suggested external port and lifetimes */
 )
 .await
 {

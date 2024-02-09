@@ -7,13 +7,15 @@
 //! ## Usage
 //! ```rust,no_run
 //! async {
+//!     use std::{net::{IpAddr, Ipv4Addr}, num::NonZeroU16};
+//!     use crab_nat::{InternetProtocol, PortMapping, PortMappingOptions};
 //!     // Attempt a port mapping request through PCP first and fallback to NAT-PMP.
-//!     let mapping = match crab_nat::PortMapping::new(
-//!         std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 1)) /* Address of the PCP server, often a gateway or firewall */,
-//!         std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 167)) /* Address of our client, as seen by the gateway. Only used by PCP */,
-//!         crab_nat::InternetProtocol::Tcp /* Protocol to map */,
-//!         std::num::NonZeroU16::new(8080).unwrap() /* Internal port, cannot be zero */,
-//!         PortMappingOptions::Default() /* Optional configuration values, including suggested external port and lifetimes */,
+//!     let mapping = match PortMapping::new(
+//!         IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), /* Address of the PCP server, often a gateway or firewall */
+//!         IpAddr::V4(Ipv4Addr::new(192, 168, 1, 167)), /* Address of our client, as seen by the gateway. Only strictly necessary for PCP */
+//!         InternetProtocol::Tcp, /* Protocol to map */
+//!         NonZeroU16::new(8080).unwrap(), /* Internal port, cannot be zero */
+//!         PortMappingOptions::default(), /* Optional configuration values, including suggested external port and lifetimes */
 //!     )
 //!     .await
 //!     {
@@ -32,7 +34,7 @@
 //! };
 //! ```
 
-use std::net::IpAddr;
+use std::{net::IpAddr, num::NonZeroU16};
 
 use num_enum::TryFromPrimitive;
 
@@ -75,7 +77,7 @@ pub enum InternetProtocol {
 #[derive(Clone, Copy, Debug)]
 pub enum PortMappingType {
     NatPmp,
-    Pcp { client: IpAddr },
+    Pcp { client: IpAddr, nonce: pcp::Nonce },
 }
 
 /// Configuration of the timing of UDP requests to the gateway.
@@ -94,7 +96,7 @@ pub struct TimeoutConfig {
 #[derive(Clone, Copy, Default)]
 pub struct PortMappingOptions {
     /// The external port to try to map. The server is not guaranteed to use this port.
-    pub external_port: Option<u16>,
+    pub external_port: Option<NonZeroU16>,
     /// The lifetime of the port mapping in seconds. The server is not guaranteed to use this lifetime.
     pub lifetime_seconds: Option<u32>,
     /// The configuration of the timing of UDP requests made to the gateway.
@@ -134,7 +136,7 @@ impl PortMapping {
         gateway: IpAddr,
         client: IpAddr,
         protocol: InternetProtocol,
-        internal_port: std::num::NonZeroU16,
+        internal_port: NonZeroU16,
         mapping_options: PortMappingOptions,
     ) -> Result<PortMapping, MappingFailure> {
         // Try to use the more modern protocol, PCP, first.
@@ -143,6 +145,7 @@ impl PortMapping {
             client,
             protocol,
             internal_port.get(),
+            None,
             mapping_options,
         )
         .await
@@ -168,7 +171,7 @@ impl PortMapping {
     pub async fn try_renew(&mut self) -> Result<(), MappingFailure> {
         // The optional configuration values for the port mapping request.
         let options = PortMappingOptions {
-            external_port: Some(self.external_port),
+            external_port: NonZeroU16::new(self.external_port),
             lifetime_seconds: Some(self.lifetime()),
             timeout_config: Some(self.timeout_config),
         };
@@ -185,12 +188,13 @@ impl PortMapping {
                 .await
                 .map_err(MappingFailure::from)?;
             }
-            PortMappingType::Pcp { client } => {
+            PortMappingType::Pcp { client, nonce } => {
                 *self = pcp::try_port_mapping(
                     self.gateway,
                     client,
                     self.protocol,
                     self.internal_port,
+                    Some(nonce),
                     options,
                 )
                 .await
@@ -223,11 +227,12 @@ impl PortMapping {
             )
             .await
             .map_err(|e| (MappingFailure::from(e), self)),
-            PortMappingType::Pcp { client } => pcp::try_drop_mapping(
+            PortMappingType::Pcp { client, nonce } => pcp::try_drop_mapping(
                 gateway,
                 client,
                 protocol,
                 internal_port,
+                nonce,
                 Some(self.timeout_config),
             )
             .await

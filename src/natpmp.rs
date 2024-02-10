@@ -119,6 +119,7 @@ pub async fn try_external_address(
             OperationCode::ExternalAddress as u8,
         ],
         &mut reader,
+        std::convert::identity,
     )
     .await?;
 
@@ -223,7 +224,14 @@ pub async fn try_port_mapping(
         .unwrap_or(TIMEOUT_CONFIG_DEFAULT);
 
     // Try to send the request data until a response is read, respecting the RFC recommended timeouts and retries counts.
-    let n = helpers::try_send_until_response(timeout_config, &socket, &send_buf, &mut bb).await?;
+    let n = helpers::try_send_until_response(
+        timeout_config,
+        &socket,
+        &send_buf,
+        &mut bb,
+        std::convert::identity,
+    )
+    .await?;
 
     // A port mapping response is always expected to be 16 bytes.
     if n != 16 {

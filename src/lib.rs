@@ -2,7 +2,7 @@
 
 //! A library providing a pure Rust implementation of a client for both the NAT Port Mapping Protocol (NAT-PMP, [RFC 6886](https://www.rfc-editor.org/rfc/rfc6886)) and the Port Control Protocol (PCP, [RFC 6887](https://www.rfc-editor.org/rfc/rfc6887)).
 
-//! This library is intended to feel like high level, idiomatic Rust, while still maintaining a strong focus on performance. It is asyncronous, and uses the [tokio](https://tokio.rs) runtime to avoid blocking operations and succinctly handle timeouts on UDP sockets.
+//! This library is intended to feel like high level, idiomatic Rust, while still maintaining a strong focus on performance. It is asynchronous and uses the [tokio](https://tokio.rs) runtime to avoid blocking operations and to succinctly handle timeouts on UDP sockets.
 
 //! ## Usage
 //! ```rust,no_run
@@ -305,17 +305,22 @@ mod helpers {
     }
 
     /// Send a request and wait for a response, retrying on timeout up to `max_retries` times.
+    /// Allow for a custom fuzzing function to be applied to the timeout after each retry. This is to avoid synchronization issues, but `std::convert::identity` can be used as a no-op.
     /// # Errors
     /// Will return a `Socket(..)` error if we:
     /// * Failed to send data on the socket
     /// * Failed to receive data on the socket
     /// Otherwise, will return a `Timeout` error if the gateway could not be reached after all retries.
-    pub async fn try_send_until_response(
+    pub async fn try_send_until_response<F>(
         timeout_config: TimeoutConfig,
         socket: &UdpSocket,
         send_bytes: &[u8],
         recv_buf: &mut bytes::BytesMut,
-    ) -> Result<usize, RequestSendError> {
+        fuzz_timeout: F,
+    ) -> Result<usize, RequestSendError>
+    where
+        F: Fn(Duration) -> Duration,
+    {
         // Create an internal helper to easily try sending and receiving packets, and springboard errors back to the caller.
         async fn send_and_recv(
             socket: &UdpSocket,
@@ -349,16 +354,19 @@ mod helpers {
                     }
                     retries += 1;
 
-                    // Follow RFC recommendation to double the timeout on each successive failure.
-                    // TODO: PCP Requires a random value in [0.9, 1.1] be multiplied by the timeout.
+                    // Both NAT-PMP and PCP have a base scaling of doubling the timeout each retry.
                     wait += wait;
 
                     // Limit the timeout to the configured maximum.
+                    // This was added to in PCP RFC, but is supported here for both protocols.
                     if let Some(max) = timeout_config.max_retry_timeout {
                         if wait > max {
                             wait = max;
                         }
                     }
+
+                    // PCP specifies that fuzzing be done after applying the maximum timeout, to avoid synchronization issues.
+                    fuzz_timeout(wait);
 
                     #[cfg(debug_assertions)]
                     println!(

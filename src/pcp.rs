@@ -5,6 +5,7 @@ use std::{
 };
 
 use bytes::{Buf as _, BufMut as _, BytesMut};
+use rand::Rng as _;
 
 use crate::{
     helpers::{self, RequestSendError},
@@ -147,7 +148,8 @@ pub async fn try_port_mapping(
     }
 
     // Use an existing session nonce or generate 96 new random bits.
-    let nonce: Nonce = session_nonce.unwrap_or_else(|| [rand::random(), rand::random(), rand::random()]);
+    let nonce: Nonce =
+        session_nonce.unwrap_or_else(|| [rand::random(), rand::random(), rand::random()]);
 
     let PcpResponse { n, mut bb } = try_send_map_request(
         gateway,
@@ -360,10 +362,15 @@ async fn try_send_map_request(
     // Send the request to the gateway.
     let request = bb.split();
 
-    // <https://www.rfc-editor.org/rfc/rfc6887#section-8.1.1> TODO: Expands on PCP timing in detail. Requires randomized timeouts.
-    let n = helpers::try_send_until_response(timeout_config, &socket, &request, &mut bb)
-        .await
-        .map_err(Failure::from)?;
+    // PCP Requires a random value in [0.9, 1.1] be multiplied by the timeout.
+    // <https://www.rfc-editor.org/rfc/rfc6887#section-8.1.1> Expands on PCP timing in detail.
+    let dist = rand::distributions::Uniform::new(0.9, 1.1);
+    let fuzz_timeout = |wait: Duration| wait.mul_f64(rand::thread_rng().sample(dist));
+
+    let n =
+        helpers::try_send_until_response(timeout_config, &socket, &request, &mut bb, fuzz_timeout)
+            .await
+            .map_err(Failure::from)?;
 
     Ok(PcpResponse { n, bb })
 }

@@ -31,6 +31,7 @@ const TIMEOUT_CONFIG_DEFAULT: TimeoutConfig = TimeoutConfig {
     max_retry_timeout: Some(Duration::from_secs(MAX_TIMEOUT_SECONDS)),
 };
 
+/// A unqie session identifier for a PCP client.
 pub type Nonce = [u32; 3];
 
 /// Valid result codes from a PCP response.
@@ -85,14 +86,16 @@ pub enum ResultCode {
 #[derive(Debug, num_enum::TryFromPrimitive, PartialEq)]
 #[repr(u8)]
 pub enum OperationCode {
-    /// Map a UDP port on the gateway.
+    /// Create a port mapping on the gateway.
     Map = 1,
-    /// Map a TCP port on the gateway.
+
+    /// Map outbound requests to a peer through an address on the gateway.
+    // TODO: Not yet implemented.
     Peer,
 }
 
-#[derive(Debug, thiserror::Error)]
 /// Errors that may occur when trying to map a port on the gateway, categorized by the root of the issue.
+#[derive(Debug, thiserror::Error)]
 pub enum Failure {
     /// Failed to bind, connect, read, or write to a UDP socket.
     #[error("UDP socket error: {0}")]
@@ -111,7 +114,6 @@ pub enum Failure {
     #[error("Gateway error: {0}")]
     ResultCode(ResultCode),
 }
-
 impl From<RequestSendError> for Failure {
     fn from(e: RequestSendError) -> Self {
         match e {
@@ -121,7 +123,34 @@ impl From<RequestSendError> for Failure {
     }
 }
 
+/// The values that must be explicitly defined for all PCP map requests.
+#[derive(Clone, Copy)]
+pub struct BaseMapRequest {
+    pub gateway: IpAddr,
+    pub client: IpAddr,
+    pub protocol: InternetProtocol,
+    pub internal_port: u16,
+}
+impl BaseMapRequest {
+    /// Create a new `BaseMapRequest` with the given gateway, client, protocol, and internal port.
+    #[must_use]
+    pub fn new(
+        gateway: IpAddr,
+        client: IpAddr,
+        protocol: InternetProtocol,
+        internal_port: u16,
+    ) -> Self {
+        Self {
+            gateway,
+            client,
+            protocol,
+            internal_port,
+        }
+    }
+}
+
 /// Attempts to map a port on the gateway using PCP.
+/// An internal port of `0` will forward all ports on this protocol to our client address.
 /// Will try to use the given external port if it is `Some`, otherwise it will let the gateway choose.
 /// # Errors
 /// Returns a `pcp::Failure` enum which decomposes into different errors depending on the cause:
@@ -129,35 +158,25 @@ impl From<RequestSendError> for Failure {
 /// * `Timeout` if the gateway is not responding
 /// * `InvalidResponse` if the gateway gave an invalid response
 /// * `ResultCode` if the gateway gave a valid response, but it was an error. Will never return `ResultCode::Success` as an error.
-/// Also, if the given `internal_port` is `0` and the `lifetime_seconds` is not `Some(0)`, will return `ResultCode::MalformedRequest`.
 pub async fn try_port_mapping(
-    gateway: IpAddr,
-    client: IpAddr,
-    protocol: InternetProtocol,
-    internal_port: u16,
+    base: BaseMapRequest,
     session_nonce: Option<Nonce>,
+    external_ip: Option<IpAddr>,
     mapping_options: PortMappingOptions,
 ) -> Result<PortMapping, Failure> {
     let timeout_config = mapping_options
         .timeout_config
         .unwrap_or(TIMEOUT_CONFIG_DEFAULT);
 
-    // Ensure that a local port of `0` is only used for deletion requests.
-    if internal_port == 0 && !mapping_options.lifetime_seconds.is_some_and(|l| l == 0) {
-        return Err(Failure::ResultCode(ResultCode::MalformedRequest));
-    }
-
     // Use an existing session nonce or generate 96 new random bits.
     let nonce: Nonce =
         session_nonce.unwrap_or_else(|| [rand::random(), rand::random(), rand::random()]);
 
     let PcpResponse { n, mut bb } = try_send_map_request(
-        gateway,
-        client,
-        protocol,
-        internal_port,
+        base,
         nonce,
         mapping_options.external_port,
+        external_ip,
         mapping_options
             .lifetime_seconds
             .unwrap_or(RECOMMENDED_MAPPING_LIFETIME_SECONDS),
@@ -165,8 +184,213 @@ pub async fn try_port_mapping(
     )
     .await?;
 
+    // Validate the response header.
+    let ResponseHeader {
+        lifetime_seconds,
+        gateway_epoch_seconds,
+    } = validate_base_response(&mut bb)?;
+
+    let BaseMapRequest {
+        gateway,
+        client,
+        protocol,
+        internal_port,
+    } = base;
+
+    // Ensure we can read the rest of the map response.
+    if n < 60 {
+        let bits = &bb[..n];
+        return Err(Failure::InvalidResponse(format!(
+            "Too few bytes received: {n}, expected 60: {bits:X?}"
+        )));
+    }
+
+    // Validate the mapping response values.
+    let response_nonce = [bb.get_u32(), bb.get_u32(), bb.get_u32()];
+    if response_nonce != nonce {
+        // If we received a message with a different nonce, fail with a timeout to retry.
+        return Err(Failure::Timeout);
+    }
+    let response_protocol = bb.get_u8();
+    if response_protocol != protocol_to_byte(protocol) {
+        return Err(Failure::InvalidResponse(format!(
+            "Incorrect protocol: {response_protocol:?}"
+        )));
+    }
+    let _ = [bb.get_u8(), bb.get_u8(), bb.get_u8()]; // Reserved.
+
+    let response_internal_port = bb.get_u16();
+    if response_internal_port != internal_port {
+        return Err(Failure::InvalidResponse(format!(
+            "Incorrect internal port returned: {response_internal_port:?}"
+        )));
+    }
+
+    // The external port assigned to our mapping. The server may not use the requested port, if present.
+    let external_port = bb.get_u16();
+
+    // The external IP address assigned to our mapping.
+    let external_ip = read_ip6_addr(&mut bb);
+    let external_ip = if let Some(ip) = external_ip.to_ipv4_mapped() {
+        IpAddr::V4(ip)
+    } else {
+        IpAddr::V6(external_ip)
+    };
+
+    Ok(PortMapping {
+        gateway,
+        protocol,
+        internal_port,
+        external_port,
+        lifetime_seconds,
+        expiration: std::time::Instant::now() + Duration::from_secs(u64::from(lifetime_seconds)),
+        gateway_epoch_seconds,
+        mapping_type: PortMappingType::Pcp {
+            client,
+            nonce,
+            external_ip,
+        },
+        timeout_config,
+    })
+}
+
+/// Attempts to remove a PCP mapping on the gateway.
+/// Using a local port of `0` will remove all port mappings for our client with the given protocol.
+/// # Notes
+/// This will likely not reduce the remaining lifetime of the mapping, but the result is not guaranteed.
+/// See <https://www.rfc-editor.org/rfc/rfc6887#section-15> for more details.
+/// # Errors
+/// Returns a `pcp::Failure` enum which decomposes into different errors depending on the cause:
+/// * `Socket` if there is an error using the UDP socket
+/// * `Timeout` if the gateway is not responding
+/// * `InvalidResponse` if the gateway gave an invalid response
+/// * `ResultCode` if the gateway gave a valid response, but it was an error. Will never return `ResultCode::Success` as an error.
+pub async fn try_drop_mapping(
+    base: BaseMapRequest,
+    nonce: Nonce,
+    external_ip: IpAddr,
+    external_port: u16,
+    timeout_config: Option<TimeoutConfig>,
+) -> Result<(), Failure> {
+    // Mapping deletion is specified by the same operation code and format as mapping creation.
+    // The difference is that the lifetime and external port must be set to `0`.
+    let PortMapping {
+        internal_port,
+        external_port,
+        lifetime_seconds,
+        ..
+    } = try_port_mapping(
+        base,
+        Some(nonce),
+        Some(external_ip),
+        PortMappingOptions {
+            external_port: NonZeroU16::new(external_port),
+            lifetime_seconds: Some(0),
+            timeout_config,
+        },
+    )
+    .await?;
+
+    // Check that the response is correct for a deletion request.
+    if internal_port != base.internal_port || lifetime_seconds != 0 {
+        return Err(Failure::InvalidResponse(format!(
+            "Invalid response to deletion request: {internal_port} {external_port} {lifetime_seconds:?}"
+        )));
+    }
+
+    Ok(())
+}
+
+/// Helper object to store the response from a PCP request, including the session nonce.
+struct PcpResponse {
+    /// The number of bytes in the response.
+    pub n: usize,
+    /// Bytestream containing the response. Only the first `n` bytes are valid.
+    pub bb: BytesMut,
+}
+
+/// Helper function to try to create and send a PCP request and return the gateway's response, if any.
+async fn try_send_map_request(
+    base: BaseMapRequest,
+    nonce: Nonce,
+    req_external_port: Option<NonZeroU16>,
+    req_external_ip: Option<IpAddr>,
+    lifetime_seconds: u32,
+    timeout_config: TimeoutConfig,
+) -> Result<PcpResponse, Failure> {
+    /// Helper to extract the `Ipv6Addr` from an `IpAddr` or map an `Ipv4Addr` properly.
+    fn get_req_ipv6(ip: IpAddr) -> Ipv6Addr {
+        match ip {
+            IpAddr::V4(v4) => v4.to_ipv6_mapped(),
+            IpAddr::V6(v6) => v6,
+        }
+    }
+
+    // Create a new UDP socket to communicate with the gateway.
+    let socket = helpers::new_socket(base.gateway)
+        .await
+        .map_err(Failure::Socket)?;
+
+    // PCP addresses are always specified as 128 bit addresses, <https://www.rfc-editor.org/rfc/rfc6887#section-5>.
+    // We need to map `Ipv4Addr` to an `Ipv6Addr` accoriding to RFC4291 <https://www.rfc-editor.org/rfc/rfc4291>.
+    let (client_ip6_bytes, zero_addr_ip6_bytes) = match base.client {
+        IpAddr::V4(v4) => (
+            v4.to_ipv6_mapped(),
+            req_external_ip.map_or_else(|| Ipv4Addr::UNSPECIFIED.to_ipv6_mapped(), get_req_ipv6),
+        ),
+        IpAddr::V6(v6) => (
+            v6,
+            req_external_ip.map_or(Ipv6Addr::UNSPECIFIED, get_req_ipv6),
+        ),
+    };
+
+    // Create a bitstream-friendly scratch space.
+    let mut bb = bytes::BytesMut::with_capacity(MAX_DATAGRAM_SIZE << 1);
+
+    // Create the common PCP request header.
+    bb.put_u8(VersionCode::Pcp as u8);
+    bb.put_u8(opcode_to_request(OperationCode::Map));
+    bb.put_u16(0); // Reserved.
+    bb.put_u32(lifetime_seconds);
+    bb.put(&client_ip6_bytes.octets()[..]);
+
+    // Create the mapping specific request.
+    bb.put_u32(nonce[0]);
+    bb.put_u32(nonce[1]);
+    bb.put_u32(nonce[2]);
+    bb.put_u8(protocol_to_byte(base.protocol));
+    bb.put(&[0u8; 3][..]); // Reserved.
+    bb.put_u16(base.internal_port);
+    bb.put_u16(req_external_port.map_or(0, NonZeroU16::get));
+    bb.put(&zero_addr_ip6_bytes.octets()[..]); // No preference on external address.
+
+    // Send the request to the gateway.
+    let request = bb.split();
+
+    // PCP Requires a random value in [0.9, 1.1] be multiplied by the timeout.
+    // <https://www.rfc-editor.org/rfc/rfc6887#section-8.1.1> Expands on PCP timing in detail.
+    let dist = rand::distributions::Uniform::new(0.9, 1.1);
+    let fuzz_timeout = |wait: Duration| wait.mul_f64(rand::thread_rng().sample(dist));
+
+    let n =
+        helpers::try_send_until_response(timeout_config, &socket, &request, &mut bb, fuzz_timeout)
+            .await
+            .map_err(Failure::from)?;
+
+    Ok(PcpResponse { n, bb })
+}
+
+/// Information contained in a valid PCP response header for this version.
+struct ResponseHeader {
+    pub lifetime_seconds: u32,
+    pub gateway_epoch_seconds: u32,
+}
+
+/// Helper function to validate the response from a PCP request. Only validates the first 24 bytes, i.e., the header.
+fn validate_base_response(bb: &mut bytes::BytesMut) -> Result<ResponseHeader, Failure> {
     // All valid PCP responses have at least 24 bytes, see <https://www.rfc-editor.org/rfc/rfc6887#section-8.3>, page 26.
-    if n < 24 {
+    if bb.len() < 24 {
+        let n = bb.len();
         let bits = &bb[..n];
 
         // Check if the resposne header matches a `natpmp::ResultCode::UnsupportedVersion` since older devices may not support PCP.
@@ -204,10 +428,7 @@ pub async fn try_port_mapping(
 
     // On error, lifetime indicates the number of seconds until the error is expected to be resolved.
     let lifetime_seconds = bb.get_u32();
-    let epoch_seconds = bb.get_u32();
-
-    #[cfg(debug_assertions)]
-    println!("DEBUG Received a response with result code {result_code:#} and lifetime {lifetime_seconds} seconds, at {epoch_seconds}");
+    let gateway_epoch_seconds = bb.get_u32();
 
     if result_code != ResultCode::Success {
         // The server gave us a correct response, but it was an error.
@@ -217,162 +438,10 @@ pub async fn try_port_mapping(
     // Reserved. Returns the last 96 bits of the 128 bit address on failure. Must be ignored on success.
     let _ = [bb.get_u32(), bb.get_u32(), bb.get_u32()];
 
-    // Validate the mapping response values.
-    let response_nonce = [bb.get_u32(), bb.get_u32(), bb.get_u32()];
-    if response_nonce != nonce {
-        // If we received a message with a different nonce, fail with a timeout to retry.
-        return Err(Failure::Timeout);
-    }
-    let response_protocol = bb.get_u8();
-    if response_protocol != protocol_to_byte(protocol) {
-        return Err(Failure::InvalidResponse(format!(
-            "Incorrect protocol: {response_protocol:?}"
-        )));
-    }
-    let _ = [bb.get_u8(), bb.get_u8(), bb.get_u8()]; // Reserved.
-
-    let response_internal_port = bb.get_u16();
-    if response_internal_port != internal_port {
-        return Err(Failure::InvalidResponse(format!(
-            "Incorrect internal port returned: {response_internal_port:?}"
-        )));
-    }
-
-    // The external port assigned to our mapping. The server may not use the requested port, if present.
-    let external_port = bb.get_u16();
-
-    // The external IP address assigned to our mapping.
-    let external_ip = read_ip6_addr(&mut bb);
-    let external_ip = if let Some(ip) = external_ip.to_ipv4_mapped() {
-        IpAddr::V4(ip)
-    } else {
-        IpAddr::V6(external_ip)
-    };
-    #[cfg(debug_assertions)]
-    println!("DEBUG Server assigned us external IP {external_ip:#}");
-
-    Ok(PortMapping {
-        gateway,
-        protocol,
-        internal_port,
-        external_port,
+    Ok(ResponseHeader {
         lifetime_seconds,
-        expiration: std::time::Instant::now() + Duration::from_secs(u64::from(lifetime_seconds)),
-        mapping_type: PortMappingType::Pcp { client, nonce },
-        timeout_config,
+        gateway_epoch_seconds,
     })
-}
-
-/// Attempts to remove a PCP mapping on the gateway.
-/// Using a local port of `0` will remove all port mappings for our client with the given protocol.
-/// # Errors
-/// Returns a `pcp::Failure` enum which decomposes into different errors depending on the cause:
-/// * `Socket` if there is an error using the UDP socket
-/// * `Timeout` if the gateway is not responding
-/// * `InvalidResponse` if the gateway gave an invalid response
-/// * `ResultCode` if the gateway gave a valid response, but it was an error. Will never return `ResultCode::Success` as an error.
-pub async fn try_drop_mapping(
-    gateway: IpAddr,
-    client: IpAddr,
-    protocol: InternetProtocol,
-    local_port: u16,
-    nonce: Nonce,
-    timeout_config: Option<TimeoutConfig>,
-) -> Result<(), Failure> {
-    // Mapping deletion is specified by the same operation code and format as mapping creation.
-    // The difference is that the lifetime and external port must be set to `0`.
-    let PortMapping {
-        internal_port,
-        external_port,
-        lifetime_seconds,
-        ..
-    } = try_port_mapping(
-        gateway,
-        client,
-        protocol,
-        local_port,
-        Some(nonce),
-        PortMappingOptions {
-            external_port: None,
-            lifetime_seconds: Some(0),
-            timeout_config,
-        },
-    )
-    .await?;
-
-    // Check that the response is correct for a deletion request.
-    if internal_port != local_port || external_port != 0 || lifetime_seconds != 0 {
-        return Err(Failure::InvalidResponse(format!(
-            "Invalid response to deletion request: {internal_port} {external_port} {lifetime_seconds:?}"
-        )));
-    }
-
-    Ok(())
-}
-
-/// Helper object to store the response from a PCP request, including the session nonce.
-struct PcpResponse {
-    /// The number of bytes in the response.
-    pub n: usize,
-    /// Bytestream containing the response. Only the first `n` bytes are valid.
-    pub bb: BytesMut,
-}
-
-/// Helper function to try to create and send a PCP request and return the gateway's response, if any.
-async fn try_send_map_request(
-    gateway: IpAddr,
-    client: IpAddr,
-    protocol: InternetProtocol,
-    internal_port: u16,
-    nonce: Nonce,
-    req_external_port: Option<NonZeroU16>,
-    lifetime_seconds: u32,
-    timeout_config: TimeoutConfig,
-) -> Result<PcpResponse, Failure> {
-    let socket = helpers::new_socket(gateway)
-        .await
-        .map_err(Failure::Socket)?;
-
-    // PCP addresses are always specified as 128 bit addresses, <https://www.rfc-editor.org/rfc/rfc6887#section-5>.
-    // We need to map `Ipv4Addr` accoriding to RFC4291 <https://www.rfc-editor.org/rfc/rfc4291>.
-    let (client_ip6_bytes, zero_addr_ip6_bytes) = match client {
-        IpAddr::V4(v4) => (v4.to_ipv6_mapped(), Ipv4Addr::UNSPECIFIED.to_ipv6_mapped()),
-        IpAddr::V6(v6) => (v6, Ipv6Addr::UNSPECIFIED),
-    };
-
-    let mut bb = bytes::BytesMut::with_capacity(MAX_DATAGRAM_SIZE << 1);
-
-    // Create the common PCP request header.
-    bb.put_u8(VersionCode::Pcp as u8);
-    bb.put_u8(opcode_to_request(OperationCode::Map));
-    bb.put_u16(0); // Reserved.
-    bb.put_u32(lifetime_seconds);
-    bb.put(&client_ip6_bytes.octets()[..]);
-
-    // Create the mapping specific request.
-    bb.put_u32(nonce[0]);
-    bb.put_u32(nonce[1]);
-    bb.put_u32(nonce[2]);
-    bb.put_u8(protocol_to_byte(protocol));
-    bb.put(&[0u8; 3][..]); // Reserved.
-    bb.put_u16(internal_port);
-    bb.put_u16(req_external_port.map_or(0, NonZeroU16::get));
-    bb.put(&zero_addr_ip6_bytes.octets()[..]); // No preference on external address.
-
-    // Send the request to the gateway.
-    let request = bb.split();
-
-    // PCP Requires a random value in [0.9, 1.1] be multiplied by the timeout.
-    // <https://www.rfc-editor.org/rfc/rfc6887#section-8.1.1> Expands on PCP timing in detail.
-    let dist = rand::distributions::Uniform::new(0.9, 1.1);
-    let fuzz_timeout = |wait: Duration| wait.mul_f64(rand::thread_rng().sample(dist));
-
-    let n =
-        helpers::try_send_until_response(timeout_config, &socket, &request, &mut bb, fuzz_timeout)
-            .await
-            .map_err(Failure::from)?;
-
-    Ok(PcpResponse { n, bb })
 }
 
 /// Request `OperationCode` bits are the same as the abstract `OperationCode`s, but left shifted by one.

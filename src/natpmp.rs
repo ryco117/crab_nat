@@ -55,8 +55,10 @@ pub enum ResultCode {
 pub enum OperationCode {
     /// Request the public IP address of the gateway.
     ExternalAddress,
+
     /// Map a UDP port on the gateway.
     MapUdp,
+
     /// Map a TCP port on the gateway.
     MapTcp,
 }
@@ -81,7 +83,6 @@ pub enum Failure {
     #[error("Gateway error: {0}")]
     ResultCode(ResultCode),
 }
-
 impl From<RequestSendError> for Failure {
     fn from(e: RequestSendError) -> Self {
         match e {
@@ -146,12 +147,10 @@ pub async fn try_external_address(
         )));
     }
 
-    // Read and verify the result code. Also, optionally print the gateway epoch.
+    // Read and verify the result code.
     let result_code = ResultCode::try_from(reader.get_u16())
         .map_err(|r| Failure::InvalidResponse(format!("Invalid result code: {r:#}")))?;
-    let gateway_epoch = Duration::from_secs(u64::from(reader.get_u32()));
-    #[cfg(debug_assertions)]
-    println!("DEBUG Gateway epoch was {gateway_epoch:?} ago");
+    let _gateway_epoch_seconds = reader.get_u32();
 
     if result_code != ResultCode::Success {
         // The server gave us a correct response, but it was an error.
@@ -166,9 +165,6 @@ pub async fn try_external_address(
         reader.get_u8(),
     );
 
-    #[cfg(debug_assertions)]
-    println!("DEBUG Gateway external IP: {external_ip:#}");
-
     Ok(external_ip)
 }
 
@@ -181,12 +177,18 @@ pub async fn try_external_address(
 /// * `Timeout` if the gateway is not responding
 /// * `InvalidResponse` if the gateway gave an invalid response
 /// * `ResultCode` if the gateway gave a valid response, but it was an error. Will never return `ResultCode::Success` as an error.
+/// Also, if the given `internal_port` is `0` and the `lifetime_seconds` is not `Some(0)`, will return `ResultCode::NotAuthorized`.
 pub async fn try_port_mapping(
     gateway: IpAddr,
     protocol: InternetProtocol,
     internal_port: u16,
     mapping_options: PortMappingOptions,
 ) -> Result<PortMapping, Failure> {
+    // Ensure that a local port of `0` is only used for deletion requests.
+    if internal_port == 0 && !mapping_options.lifetime_seconds.is_some_and(|l| l == 0) {
+        return Err(Failure::ResultCode(ResultCode::NotAuthorized));
+    }
+
     let socket = helpers::new_socket(gateway)
         .await
         .map_err(Failure::Socket)?;
@@ -260,13 +262,10 @@ pub async fn try_port_mapping(
         }
     };
 
-    // Read and verify the result code. Also, optionally print the gateway epoch.
+    // Read and verify the result code.
     let response_code = ResultCode::try_from(bb.get_u16())
         .map_err(|r| Failure::InvalidResponse(format!("Invalid result code: {r:#}")))?;
-    let gateway_epoch = Duration::from_secs(u64::from(bb.get_u32()));
-
-    #[cfg(debug_assertions)]
-    println!("DEBUG Gateway epoch was {gateway_epoch:?} ago");
+    let gateway_epoch_seconds = bb.get_u32();
 
     if response_code != ResultCode::Success {
         // The server gave us a correct response, but it was an error.
@@ -291,6 +290,7 @@ pub async fn try_port_mapping(
         external_port,
         lifetime_seconds,
         expiration: std::time::Instant::now() + Duration::from_secs(u64::from(lifetime_seconds)),
+        gateway_epoch_seconds,
         mapping_type: PortMappingType::NatPmp,
         timeout_config,
     })

@@ -38,6 +38,8 @@ Crab NAT does not determine the gateway address or the local client address. Thi
   * https://www.rfc-editor.org/rfc/rfc6886#section-3.2.1 states that NAT-PMP clients should listen for external IP address changes from the gateway. This is not currently implemented, and I am unsure how useful this would be.
 * PCP:
   * https://www.rfc-editor.org/rfc/rfc6887#section-8.1.1 describes more complex request timing configurations than are currently implemented.
+  * https://www.rfc-editor.org/rfc/rfc6887#section-11.1 states that the lifetime value on error indicates how long the error will persist for. This is not returned to the caller.
+  * https://www.rfc-editor.org/rfc/rfc6887#section-11.3 states that a protocol of `0` is valid if the internal port is also `0`. This is not currently implemented but may be useful.
   * PCP describes a `Peer` operation which is not yet implemented.
   * PCP describes an `Announce` operation, which I don't plan to implement.
   * PCP supports more protocols than just UDP and TCP which are not yet added. I'm open to supporting more protocols if they are requested.

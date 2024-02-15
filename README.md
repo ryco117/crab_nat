@@ -5,7 +5,7 @@ A library providing a pure Rust implementation of a client for both the NAT Port
 This library is intended to feel like high level, idiomatic Rust, while still maintaining a strong focus on performance. It is asynchronous and uses the [tokio](https://tokio.rs) runtime to avoid blocking operations and to succinctly handle timeouts on UDP sockets.
 
 ## Usage
-If there isn't a preference on which protocol is used or what the external port should be, usage looks as follows:
+If there isn't a preference on which port mapping protocol is used or what the external port should be, usage looks as follows:
 ```rust
 // Attempt a port mapping request through PCP first and fallback to NAT-PMP.
 let mapping = match crab_nat::PortMapping::new(
@@ -37,7 +37,6 @@ Crab NAT does not determine the gateway address or the local client address. Thi
 * NAT-PMP:
   * https://www.rfc-editor.org/rfc/rfc6886#section-3.2.1 states that NAT-PMP clients should listen for external IP address changes from the gateway. This is not currently implemented, and I am unsure how useful this would be.
 * PCP:
-  * https://www.rfc-editor.org/rfc/rfc6887#section-8.1.1 describes more complex request timing configurations than are currently implemented.
   * https://www.rfc-editor.org/rfc/rfc6887#section-11.1 states that the lifetime value on error indicates how long the error will persist for. This is not returned to the caller.
   * https://www.rfc-editor.org/rfc/rfc6887#section-11.3 states that a protocol of `0` is valid if the internal port is also `0`. This is not currently implemented but may be useful.
   * PCP describes a `Peer` operation which is not yet implemented.

@@ -146,8 +146,8 @@ impl PortMapping {
     /// If no lifetime is specified, the NAT-PMP recommended lifetime of two hours will be used.
     /// # Errors
     /// Returns a `MappingFailure` enum which decomposes into `NatPmp(natpmp::Failure)` and `Pcp(pcp::Failure)` depending on which failed.
-    /// Will never return `Pcp(pcp::Failure::ResultCode(pcp::ResultCode::UnsupportedVersion))` because this call will always fall back to NAT-PMP.
-    /// If a `Pcp(_)` error is returned, then NAT-PMP is likely not supported by the gateway and this call will not attempt it.
+    /// Will never return `Pcp(pcp::Failure::ResultCode(pcp::ResultCode::UnsupportedVersion))` because NAT-PMP will be used as a fallback in this case.
+    /// If a different `Pcp(_)` error is returned, then NAT-PMP is likely not supported by the gateway and this call will not attempt it.
     /// If you want to still attempt NAT-PMP after PCP fails for unknown reasons, you can call `natpmp::try_port_mapping(..)` directly.
     pub async fn new(
         gateway: IpAddr,

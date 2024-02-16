@@ -177,15 +177,19 @@ pub async fn try_external_address(
 /// * `Timeout` if the gateway is not responding
 /// * `InvalidResponse` if the gateway gave an invalid response
 /// * `ResultCode` if the gateway gave a valid response, but it was an error. Will never return `ResultCode::Success` as an error.
-/// Also, if the given `internal_port` is `0` and the `lifetime_seconds` is not `Some(0)`, will return `ResultCode::NotAuthorized`.
+/// Also, if the `internal_port` is `0` and the `lifetime_seconds` is not `Some(0)` or the `external_port` is not `None`, will return `ResultCode::NotAuthorized`.
 pub async fn try_port_mapping(
     gateway: IpAddr,
     protocol: InternetProtocol,
     internal_port: u16,
     mapping_options: PortMappingOptions,
 ) -> Result<PortMapping, Failure> {
-    // Ensure that a local port of `0` is only used for deletion requests.
-    if internal_port == 0 && !mapping_options.lifetime_seconds.is_some_and(|l| l == 0) {
+    // Ensure that a local port of `0` is only used for valid "delete all" requests.
+    // See the last paragraph of section 3.4, <https://www.rfc-editor.org/rfc/rfc6886#section-3.4>.
+    if internal_port == 0
+        && (!mapping_options.lifetime_seconds.is_some_and(|l| l == 0)
+            || mapping_options.external_port.is_some())
+    {
         return Err(Failure::ResultCode(ResultCode::NotAuthorized));
     }
 

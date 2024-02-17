@@ -128,7 +128,7 @@ pub struct PortMapping {
     /// The lifetime of the port mapping in seconds.
     lifetime_seconds: u32,
 
-    /// The datetime the port mapping is set to expire at.
+    /// The datetime the port mapping is set to expire at, using this machine's clock.
     expiration: std::time::Instant,
 
     /// The gateway epoch time when the port mapping was created.
@@ -270,34 +270,42 @@ impl PortMapping {
         }
     }
 
+    /// The address of the gateway the mapping is registered with.
     #[must_use]
     pub fn gateway(&self) -> IpAddr {
         self.gateway
     }
+    /// The protocol the mapping is for.
     #[must_use]
     pub fn protocol(&self) -> InternetProtocol {
         self.protocol
     }
+    /// The internal/local port of the port mapping.
     #[must_use]
     pub fn internal_port(&self) -> u16 {
         self.internal_port
     }
+    /// The external port of the port mapping.
     #[must_use]
     pub fn external_port(&self) -> u16 {
         self.external_port
     }
+    /// The lifetime of the port mapping in seconds.
     #[must_use]
     pub fn lifetime(&self) -> u32 {
         self.lifetime_seconds
     }
+    /// The datetime the port mapping is set to expire at, using this machine's clock.
     #[must_use]
     pub fn expiration(&self) -> std::time::Instant {
         self.expiration
     }
+    /// The gateway epoch time when the port mapping was created.
     #[must_use]
     pub fn gateway_epoch(&self) -> u32 {
         self.gateway_epoch_seconds
     }
+    /// The type of mapping protocol used, as well as any protocol specific parameters.
     #[must_use]
     pub fn mapping_type(&self) -> PortMappingType {
         self.mapping_type

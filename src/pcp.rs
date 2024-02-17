@@ -105,6 +105,10 @@ pub enum Failure {
     #[error("Gateway did not respond within the timeout")]
     Timeout,
 
+    /// Our UDP socket received a nonce we weren't expecting.
+    #[error("Incorrect nonce received from the gateway")]
+    Nonce,
+
     /// The gateway did not give a valid response according to the NAT-PMP protocol.
     #[error("Invalid response: {0}")]
     InvalidResponse(String),
@@ -214,26 +218,14 @@ pub async fn try_port_mapping(
     }
 
     // Validate the mapping response values.
-    let response_nonce = [bb.get_u32(), bb.get_u32(), bb.get_u32()];
-    if response_nonce != nonce {
-        // If we received a message with a different nonce, fail with a timeout to allow a retry.
-        return Err(Failure::Timeout);
-    }
-    let response_protocol = bb.get_u8();
-    if response_protocol != protocol_to_byte(protocol) {
-        return Err(Failure::InvalidResponse(format!(
-            "Incorrect protocol {response_protocol}, expected {:?}",
-            base.protocol,
-        )));
-    }
+    validate_nonce(&mut bb, nonce)?;
+    validate_protocol(&mut bb, protocol)?;
     bb.advance(3); // Reserved.
-
-    let response_internal_port = bb.get_u16();
-    if response_internal_port != internal_port {
-        return Err(Failure::InvalidResponse(format!(
-            "Incorrect internal port {response_internal_port}, expected {internal_port}",
-        )));
-    }
+    validate_port(&mut bb, internal_port).map_err(|r| {
+        Failure::InvalidResponse(format!(
+            "Incorrect internal port {r}, expected {internal_port}",
+        ))
+    })?;
 
     // The external port assigned to our mapping. The server may not use the requested port, if present.
     let external_port = bb.get_u16();
@@ -310,6 +302,23 @@ pub async fn try_drop_mapping(
     Ok(())
 }
 
+/// A mapping to a peer's socket address through the gateway.
+pub struct PeerMapping {
+    pub nonce: Nonce,
+    pub gateway: IpAddr,
+    pub client: IpAddr,
+    pub protocol: InternetProtocol,
+    pub internal_port: u16,
+    pub external_ip: IpAddr,
+    pub external_port: NonZeroU16,
+    pub remote_ip: IpAddr,
+    pub remote_port: NonZeroU16,
+    pub lifetime_seconds: u32,
+    pub expiration: std::time::Instant,
+    pub gateway_epoch_seconds: u32,
+    pub timeout_config: TimeoutConfig,
+}
+
 /// Attempts to open a mapping to a remote peer's socket address.
 /// # Errors
 /// Returns a `pcp::Failure` enum which decomposes into different errors depending on the cause:
@@ -325,7 +334,7 @@ pub async fn try_peer_mapping(
     remote_port: NonZeroU16,
     remote_ip: IpAddr,
     mapping_options: PortMappingOptions,
-) -> Result<PortMapping, Failure> {
+) -> Result<PeerMapping, Failure> {
     // Peer requests cannot have an internal port of zero.
     if base.internal_port == 0 {
         return Err(Failure::ResultCode(ResultCode::MalformedRequest));
@@ -384,10 +393,7 @@ pub async fn try_peer_mapping(
             .map_err(Failure::from)?;
 
     // Validate the response header.
-    let ResponseHeader {
-        lifetime_seconds,
-        gateway_epoch_seconds,
-    } = validate_base_response(&mut bb)?;
+    let header = validate_base_response(&mut bb)?;
 
     // Ensure we can read the rest of the peer response.
     if n < 80 {
@@ -398,34 +404,24 @@ pub async fn try_peer_mapping(
     }
 
     // Validate the nonce.
-    let response_nonce = [bb.get_u32(), bb.get_u32(), bb.get_u32()];
-    if response_nonce != nonce {
-        // If we received a message with a different nonce, fail with a timeout to allow a retry.
-        return Err(Failure::Timeout);
-    }
+    validate_nonce(&mut bb, nonce)?;
 
-    // Validate the protocol.
-    let response_protocol = bb.get_u8();
-    if response_protocol != protocol_to_byte(base.protocol) {
-        return Err(Failure::InvalidResponse(format!(
-            "Incorrect protocol {response_protocol:?}, expected {:?}",
-            base.protocol,
-        )));
-    }
+    // Validate the internet protocol.
+    validate_protocol(&mut bb, base.protocol)?;
 
     bb.advance(3); // Reserved.
 
     // Validate the internal port.
-    let response_internal_port = bb.get_u16();
-    if response_internal_port != base.internal_port {
-        return Err(Failure::InvalidResponse(format!(
-            "Incorrect internal port {response_internal_port:?}, expected {}",
+    validate_port(&mut bb, base.internal_port).map_err(|r| {
+        Failure::InvalidResponse(format!(
+            "Incorrect internal port {r}, expected {}",
             base.internal_port,
-        )));
-    }
+        ))
+    })?;
 
     // The external port assigned to our mapping. The server may not use the requested port, if present.
-    let external_port = bb.get_u16();
+    let external_port = NonZeroU16::new(bb.get_u16())
+        .ok_or_else(|| Failure::InvalidResponse("Received external port of 0".to_owned()))?;
 
     // The external IP address assigned to our mapping.
     let external_ip = read_ip6_addr(&mut bb);
@@ -436,13 +432,12 @@ pub async fn try_peer_mapping(
     };
 
     // Validate the remote port.
-    let response_remote_port = bb.get_u16();
-    if response_remote_port != remote_port.get() {
-        return Err(Failure::InvalidResponse(format!(
-            "Incorrect remote port {response_remote_port}, expected {}",
-            remote_port.get()
-        )));
-    }
+    validate_port(&mut bb, remote_port.get()).map_err(|r| {
+        Failure::InvalidResponse(format!(
+            "Incorrect remote port {r}, expected {}",
+            remote_port.get(),
+        ))
+    })?;
 
     bb.advance(2); // Reserved.
 
@@ -459,19 +454,20 @@ pub async fn try_peer_mapping(
         )));
     }
 
-    Ok(PortMapping {
+    Ok(PeerMapping {
+        nonce,
         gateway: base.gateway,
+        client: base.client,
         protocol: base.protocol,
         internal_port: base.internal_port,
+        external_ip,
         external_port,
-        lifetime_seconds,
-        expiration: std::time::Instant::now() + Duration::from_secs(u64::from(lifetime_seconds)),
-        gateway_epoch_seconds,
-        mapping_type: PortMappingType::Pcp {
-            client: base.client,
-            nonce,
-            external_ip,
-        },
+        remote_ip,
+        remote_port,
+        lifetime_seconds: header.lifetime_seconds,
+        expiration: std::time::Instant::now()
+            + Duration::from_secs(u64::from(header.lifetime_seconds)),
+        gateway_epoch_seconds: header.gateway_epoch_seconds,
         timeout_config,
     })
 }
@@ -677,4 +673,36 @@ fn read_ip6_addr(bb: &mut bytes::BytesMut) -> Ipv6Addr {
         bb.get_u16(),
         bb.get_u16(),
     )
+}
+
+/// Validate a nonce value received.
+fn validate_nonce(bb: &mut bytes::BytesMut, expected_nonce: Nonce) -> Result<(), Failure> {
+    let response_nonce = [bb.get_u32(), bb.get_u32(), bb.get_u32()];
+    if response_nonce != expected_nonce {
+        return Err(Failure::Nonce);
+    }
+    Ok(())
+}
+
+/// Validate a port value received.
+fn validate_port(bb: &mut bytes::BytesMut, expected_port: u16) -> Result<(), u16> {
+    let response_port = bb.get_u16();
+    if response_port != expected_port {
+        return Err(response_port);
+    }
+    Ok(())
+}
+
+/// Validate a protocol received.
+fn validate_protocol(
+    bb: &mut bytes::BytesMut,
+    expected_protocol: InternetProtocol,
+) -> Result<(), Failure> {
+    let response_protocol = bb.get_u8();
+    if response_protocol != protocol_to_byte(expected_protocol) {
+        return Err(Failure::InvalidResponse(format!(
+            "Incorrect protocol {response_protocol}, expected {expected_protocol:?}"
+        )));
+    }
+    Ok(())
 }

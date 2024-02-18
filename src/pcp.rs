@@ -90,7 +90,6 @@ pub enum OperationCode {
     Map = 1,
 
     /// Map outbound requests to a peer through an address on the gateway.
-    // TODO: Not yet implemented.
     Peer,
 }
 

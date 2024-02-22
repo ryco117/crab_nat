@@ -22,7 +22,7 @@ struct Cli {
 
     /// The external port to try to map. Server is not guaranteed to use this port.
     #[arg(short = 'e', long)]
-    external_port: Option<u16>,
+    external_port: Option<NonZeroU16>,
 
     /// Fetch the external IP address through NAT-PMP and exit.
     #[arg(short = 'x', long)]
@@ -75,8 +75,13 @@ async fn main() {
 
     if args.delete {
         // Attempt a port unmapping request.
-        if let Err(e) =
-            crab_nat::natpmp::try_drop_mapping(gateway, protocol, args.internal_port, None).await
+        if let Err(e) = crab_nat::natpmp::try_drop_mapping(
+            gateway,
+            protocol,
+            NonZeroU16::new(args.internal_port),
+            None,
+        )
+        .await
         {
             return eprintln!("Failed to unmap port: {e:#}");
         }
@@ -91,7 +96,7 @@ async fn main() {
             protocol,
             NonZeroU16::new(args.internal_port).expect("Invalid internal port"),
             PortMappingOptions {
-                external_port: args.external_port.map(NonZeroU16::new).flatten(),
+                external_port: args.external_port,
                 ..Default::default()
             },
         )

@@ -1,5 +1,5 @@
 use std::{
-    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     num::NonZeroU16,
     time::Duration,
 };
@@ -126,13 +126,13 @@ impl From<RequestSendError> for Failure {
     }
 }
 
-/// The values that must be explicitly defined for all PCP map requests.
+/// The values that must be explicitly defined for all PCP single-port and peer mapping requests.
 #[derive(Clone, Copy)]
 pub struct BaseMapRequest {
     pub gateway: IpAddr,
     pub client: IpAddr,
     pub protocol: InternetProtocol,
-    pub internal_port: u16,
+    pub internal_port: NonZeroU16,
 }
 impl BaseMapRequest {
     /// Create a new `BaseMapRequest` with the given gateway, client, protocol, and internal port.
@@ -141,7 +141,7 @@ impl BaseMapRequest {
         gateway: IpAddr,
         client: IpAddr,
         protocol: InternetProtocol,
-        internal_port: u16,
+        internal_port: NonZeroU16,
     ) -> Self {
         Self {
             gateway,
@@ -153,13 +153,13 @@ impl BaseMapRequest {
 }
 
 /// Attempts to map a port on the gateway using PCP.
-/// An internal port of `0` will forward all ports on this protocol to our client address.
 /// Will try to use the given external port if it is `Some`, otherwise it will let the gateway choose.
 /// # Errors
 /// Returns a `pcp::Failure` enum which decomposes into different errors depending on the cause:
-/// * `Socket` if there is an error using the UDP socket
-/// * `Timeout` if the gateway is not responding
-/// * `InvalidResponse` if the gateway gave an invalid response
+/// * `Socket` if there is an error using the UDP socket.
+/// * `Timeout` if the gateway is not responding.
+/// * `Nonce` if the gateway gave a nonce we weren't expecting.
+/// * `InvalidResponse` if the gateway gave an invalid response.
 /// * `ResultCode` if the gateway gave a valid response, but it was an error. Will never return `ResultCode::Success` as an error.
 pub async fn try_port_mapping(
     base: BaseMapRequest,
@@ -167,86 +167,47 @@ pub async fn try_port_mapping(
     suggested_external_ip: Option<IpAddr>,
     mapping_options: PortMappingOptions,
 ) -> Result<PortMapping, Failure> {
-    // Ensure that a lifetime of `0` is only used for valid delete requests.
-    // See section 15.1, <https://www.rfc-editor.org/rfc/rfc6887#section-15.1>.
-    if mapping_options.lifetime_seconds.is_some_and(|l| l == 0)
-        && (suggested_external_ip.is_some() || mapping_options.external_port.is_some())
-    {
-        return Err(Failure::ResultCode(ResultCode::MalformedRequest));
-    }
-
-    let timeout_config = mapping_options
-        .timeout_config
-        .unwrap_or(TIMEOUT_CONFIG_DEFAULT);
-
-    // Use an existing session nonce or generate 96 new random bits.
-    let nonce: Nonce =
-        session_nonce.unwrap_or_else(|| [rand::random(), rand::random(), rand::random()]);
-
-    let PcpResponse { n, mut bb } = try_send_map_request(
-        base,
-        nonce,
-        mapping_options.external_port,
+    // Create a mapping range for a single port.
+    let map_range = MappingRange::Single {
+        protocol: base.protocol,
+        internal_port: base.internal_port,
+        suggested_external_port: mapping_options.external_port,
         suggested_external_ip,
-        mapping_options
-            .lifetime_seconds
-            .unwrap_or(RECOMMENDED_MAPPING_LIFETIME_SECONDS),
+    };
+
+    // Use the internal helper to try to map the port.
+    let PortMappingInternal {
+        lifetime_seconds,
+        gateway_epoch_seconds,
+        nonce,
+        external_port,
+        external_ip,
         timeout_config,
+        ..
+    } = try_port_mapping_internal(
+        base.gateway,
+        base.client,
+        session_nonce,
+        map_range,
+        mapping_options.lifetime_seconds,
+        mapping_options.timeout_config,
     )
     .await?;
 
-    // Validate the response header.
-    let ResponseHeader {
-        lifetime_seconds,
-        gateway_epoch_seconds,
-    } = validate_base_response(&mut bb)?;
-
-    let BaseMapRequest {
-        gateway,
-        client,
-        protocol,
-        internal_port,
-    } = base;
-
-    // Ensure we can read the rest of the map response.
-    if n < 60 {
-        let bits = &bb[..n];
-        return Err(Failure::InvalidResponse(format!(
-            "Too few bytes received: {n}, expected 60: {bits:X?}"
-        )));
-    }
-
-    // Validate the mapping response values.
-    validate_nonce(&mut bb, nonce)?;
-    validate_protocol(&mut bb, protocol)?;
-    bb.advance(3); // Reserved.
-    validate_port(&mut bb, internal_port).map_err(|r| {
-        Failure::InvalidResponse(format!(
-            "Incorrect internal port {r}, expected {internal_port}",
-        ))
-    })?;
-
-    // The external port assigned to our mapping. The server may not use the requested port, if present.
-    let external_port = bb.get_u16();
-
-    // The external IP address assigned to our mapping.
-    let external_ip = read_ip6_addr(&mut bb);
-    let external_ip = if let Some(ip) = external_ip.to_ipv4_mapped() {
-        IpAddr::V4(ip)
-    } else {
-        IpAddr::V6(external_ip)
-    };
+    // Ensure the external port is not zero.
+    let external_port = NonZeroU16::new(external_port)
+        .ok_or_else(|| Failure::InvalidResponse("Invalid external port of zero".to_owned()))?;
 
     Ok(PortMapping {
-        gateway,
-        protocol,
-        internal_port,
+        gateway: base.gateway,
+        protocol: base.protocol,
+        internal_port: base.internal_port,
         external_port,
         lifetime_seconds,
         expiration: std::time::Instant::now() + Duration::from_secs(u64::from(lifetime_seconds)),
         gateway_epoch_seconds,
         mapping_type: PortMappingType::Pcp {
-            client,
+            client: base.client,
             nonce,
             external_ip,
         },
@@ -254,91 +215,217 @@ pub async fn try_port_mapping(
     })
 }
 
-/// Attempts to remove a PCP mapping on the gateway.
-/// Using a local port of `0` will remove all port mappings for our client with the given protocol.
+/// A port mapping on the gateway using PCP to map all ports to our client through the PCP server.
+pub struct PortMappingAllPorts {
+    /// The address of the gateway the mapping is registered with.
+    gateway: IpAddr,
+
+    /// The address of the client the mapping is registered to.
+    client: IpAddr,
+
+    /// The protocol the mapping is for.
+    protocol: Option<InternetProtocol>,
+
+    /// The external IP of our mapping on the gateway.
+    external_ip: IpAddr,
+
+    /// The lifetime of the port mapping in seconds.
+    lifetime_seconds: u32,
+
+    /// The gateway epoch time when the port mapping was created.
+    gateway_epoch_seconds: u32,
+
+    /// The nonce used to create the port mapping.
+    nonce: Nonce,
+
+    /// The datetime the port mapping is set to expire at, using this machine's clock.
+    expiration: std::time::Instant,
+
+    /// The configuration of the timing of UDP requests made to the gateway.
+    pub timeout_config: TimeoutConfig,
+}
+
+/// Attempts to map all ports on the gateway to the corresponding port on our client using PCP.
+/// If the protocol is `None`, it will try to map all ports for all protocols.
+/// Otherwise, only the specified protocol will be mapped.
+/// The mapping
+/// # Errors
+/// Returns a `pcp::Failure` enum which decomposes into different errors depending on the cause:
+/// * `Socket` if there is an error using the UDP socket.
+/// * `Timeout` if the gateway is not responding.
+/// * `Nonce` if the gateway gave a nonce we weren't expecting.
+/// * `InvalidResponse` if the gateway gave an invalid response.
+/// * `ResultCode` if the gateway gave a valid response, but it was an error. Will never return `ResultCode::Success` as an error.
+pub async fn try_port_mapping_all_ports(
+    gateway: IpAddr,
+    client: IpAddr,
+    protocol: Option<InternetProtocol>,
+    session_nonce: Option<Nonce>,
+    suggested_external_ip: Option<IpAddr>,
+    lifetime_seconds: Option<u32>,
+    timeout_config: Option<TimeoutConfig>,
+) -> Result<PortMappingAllPorts, Failure> {
+    let map_range = MappingRange::All {
+        protocol,
+        suggested_external_ip,
+    };
+
+    let PortMappingInternal {
+        lifetime_seconds,
+        gateway_epoch_seconds,
+        nonce,
+        external_ip,
+        timeout_config,
+        ..
+    } = try_port_mapping_internal(
+        gateway,
+        client,
+        session_nonce,
+        map_range,
+        lifetime_seconds,
+        timeout_config,
+    )
+    .await?;
+
+    Ok(PortMappingAllPorts {
+        gateway,
+        client,
+        protocol,
+        external_ip,
+        lifetime_seconds,
+        gateway_epoch_seconds,
+        nonce,
+        expiration: std::time::Instant::now() + Duration::from_secs(u64::from(lifetime_seconds)),
+        timeout_config,
+    })
+}
+
+/// The range of port mappings to drop.
+/// Either a `Single` port for a given protocol or `All` ports for a single protocols, or all protocols if `None`.
+pub enum DropMappingRange {
+    Single {
+        protocol: InternetProtocol,
+        internal_port: NonZeroU16,
+    },
+    All {
+        protocol: Option<InternetProtocol>,
+    },
+}
+
+/// Attempts to remove PCP port mappings for our client from the gateway.
 /// # Notes
-/// This will likely not reduce the remaining lifetime of the mapping, but the result is not guaranteed.
+/// This may not reduce the remaining lifetime of the mapping on the PCP server for security reasons.
 /// See <https://www.rfc-editor.org/rfc/rfc6887#section-15> for more details.
 /// # Errors
 /// Returns a `pcp::Failure` enum which decomposes into different errors depending on the cause:
-/// * `Socket` if there is an error using the UDP socket
-/// * `Timeout` if the gateway is not responding
-/// * `InvalidResponse` if the gateway gave an invalid response
+/// * `Socket` if there is an error using the UDP socket.
+/// * `Timeout` if the gateway is not responding.
+/// * `Nonce` if the gateway gave a nonce we weren't expecting.
+/// * `InvalidResponse` if the gateway gave an invalid response.
 /// * `ResultCode` if the gateway gave a valid response, but it was an error. Will never return `ResultCode::Success` as an error.
 pub async fn try_drop_mapping(
-    base: BaseMapRequest,
+    gateway: IpAddr,
+    client: IpAddr,
     nonce: Nonce,
-    external_ip: IpAddr,
-    external_port: u16,
+    drop_map_range: DropMappingRange,
     timeout_config: Option<TimeoutConfig>,
 ) -> Result<(), Failure> {
+    // Create a port mapping range depending on the which type was requested.
+    let map_range = match drop_map_range {
+        DropMappingRange::Single {
+            internal_port,
+            protocol,
+        } => MappingRange::Single {
+            internal_port,
+            protocol,
+            suggested_external_port: None,
+            suggested_external_ip: None,
+        },
+        DropMappingRange::All { protocol } => MappingRange::All {
+            protocol,
+            suggested_external_ip: None,
+        },
+    };
+
     // Mapping deletion is specified by the same operation code and format as mapping creation.
     // The difference is that the lifetime and external port must be set to `0`.
-    let PortMapping {
-        internal_port,
-        external_port,
-        lifetime_seconds,
-        ..
-    } = try_port_mapping(
-        base,
+    let PortMappingInternal {
+        lifetime_seconds, ..
+    } = try_port_mapping_internal(
+        gateway,
+        client,
         Some(nonce),
-        Some(external_ip),
-        PortMappingOptions {
-            external_port: NonZeroU16::new(external_port),
-            lifetime_seconds: Some(0),
-            timeout_config,
-        },
+        map_range,
+        Some(0),
+        timeout_config,
     )
     .await?;
 
     // Check that the response is correct for a deletion request.
-    if internal_port != base.internal_port || lifetime_seconds != 0 {
+    if lifetime_seconds != 0 {
         return Err(Failure::InvalidResponse(format!(
-            "Invalid response to deletion request: {internal_port} {external_port} {lifetime_seconds:?}"
+            "Invalid response to deletion request: {lifetime_seconds}"
         )));
     }
 
     Ok(())
 }
 
-/// A mapping to a peer's socket address through the gateway.
+/// A mapping to a peer's socket address through the gateway (i.e., the PCP server).
 pub struct PeerMapping {
-    pub nonce: Nonce,
-    pub gateway: IpAddr,
-    pub client: IpAddr,
-    pub protocol: InternetProtocol,
-    pub internal_port: u16,
-    pub external_ip: IpAddr,
-    pub external_port: NonZeroU16,
-    pub remote_ip: IpAddr,
-    pub remote_port: NonZeroU16,
-    pub lifetime_seconds: u32,
-    pub expiration: std::time::Instant,
-    pub gateway_epoch_seconds: u32,
+    /// The address of the gateway the mapping is registered with.
+    gateway: IpAddr,
+
+    /// The address of the client the mapping is registered to.
+    client: IpAddr,
+
+    /// The protocol the mapping is for.
+    protocol: InternetProtocol,
+
+    /// The internal port of our mapping on the client.
+    internal_port: NonZeroU16,
+
+    /// The external IP of our mapping on the gateway.
+    external_ip: IpAddr,
+
+    /// The external port of our mapping on the gateway.
+    external_port: NonZeroU16,
+
+    /// The peer's socket address as seen by the gateway.
+    remote_address: SocketAddr,
+
+    /// The lifetime of the peer mapping in seconds.
+    lifetime_seconds: u32,
+
+    /// The gateway epoch time when the peer mapping was created.
+    gateway_epoch_seconds: u32,
+
+    /// The nonce used to create the peer mapping.
+    nonce: Nonce,
+
+    /// The datetime the peer mapping is set to expire at, using this machine's clock.
+    expiration: std::time::Instant,
+
+    /// The configuration of the timing of UDP requests made to the gateway.
     pub timeout_config: TimeoutConfig,
 }
 
 /// Attempts to open a mapping to a remote peer's socket address.
 /// # Errors
 /// Returns a `pcp::Failure` enum which decomposes into different errors depending on the cause:
-/// * `Socket` if there is an error using the UDP socket
-/// * `Timeout` if the gateway is not responding
-/// * `InvalidResponse` if the gateway gave an invalid response
+/// * `Socket` if there is an error using the UDP socket.
+/// * `Timeout` if the gateway is not responding.
+/// * `Nonce` if the gateway gave a nonce we weren't expecting.
+/// * `InvalidResponse` if the gateway gave an invalid response.
 /// * `ResultCode` if the gateway gave a valid response, but it was an error. Will never return `ResultCode::Success` as an error.
 pub async fn try_peer_mapping(
     base: BaseMapRequest,
     session_nonce: Option<Nonce>,
     suggested_external_port: Option<NonZeroU16>,
     suggested_external_ip: Option<IpAddr>,
-    remote_port: NonZeroU16,
-    remote_ip: IpAddr,
+    remote_address: SocketAddr,
     mapping_options: PortMappingOptions,
 ) -> Result<PeerMapping, Failure> {
-    // Peer requests cannot have an internal port of zero.
-    if base.internal_port == 0 {
-        return Err(Failure::ResultCode(ResultCode::MalformedRequest));
-    }
-
     let timeout_config = mapping_options
         .timeout_config
         .unwrap_or(TIMEOUT_CONFIG_DEFAULT);
@@ -366,16 +453,19 @@ pub async fn try_peer_mapping(
             .unwrap_or(RECOMMENDED_MAPPING_LIFETIME_SECONDS),
     );
 
+    // Extract the remote IP and port from the given `SocketAddr`.
+    let (remote_ip, remote_port) = (remote_address.ip(), remote_address.port());
+
     // Write the peer specific request.
     bb.put_u32(nonce[0]);
     bb.put_u32(nonce[1]);
     bb.put_u32(nonce[2]);
     bb.put_u8(protocol_to_byte(base.protocol));
     bb.put(&[0u8; 3][..]); // Reserved.
-    bb.put_u16(base.internal_port);
+    bb.put_u16(base.internal_port.get());
     bb.put_u16(suggested_external_port.map_or(0, NonZeroU16::get));
     bb.put(&suggested_ip.octets()[..]);
-    bb.put_u16(remote_port.get());
+    bb.put_u16(remote_port);
     bb.put_u16(0); // Reserved.
     bb.put(&fixed_size_addr(remote_ip).octets()[..]);
     let request = bb.split();
@@ -406,15 +496,15 @@ pub async fn try_peer_mapping(
     validate_nonce(&mut bb, nonce)?;
 
     // Validate the internet protocol.
-    validate_protocol(&mut bb, base.protocol)?;
+    validate_protocol(&mut bb, Some(base.protocol))?;
 
     bb.advance(3); // Reserved.
 
     // Validate the internal port.
-    validate_port(&mut bb, base.internal_port).map_err(|r| {
+    let internal_port = base.internal_port;
+    validate_port(&mut bb, internal_port.get()).map_err(|r| {
         Failure::InvalidResponse(format!(
-            "Incorrect internal port {r}, expected {}",
-            base.internal_port,
+            "Incorrect internal port {r}, expected {internal_port}"
         ))
     })?;
 
@@ -431,11 +521,8 @@ pub async fn try_peer_mapping(
     };
 
     // Validate the remote port.
-    validate_port(&mut bb, remote_port.get()).map_err(|r| {
-        Failure::InvalidResponse(format!(
-            "Incorrect remote port {r}, expected {}",
-            remote_port.get(),
-        ))
+    validate_port(&mut bb, remote_port).map_err(|r| {
+        Failure::InvalidResponse(format!("Incorrect remote port {r}, expected {remote_port}"))
     })?;
 
     bb.advance(2); // Reserved.
@@ -458,15 +545,122 @@ pub async fn try_peer_mapping(
         gateway: base.gateway,
         client: base.client,
         protocol: base.protocol,
-        internal_port: base.internal_port,
+        internal_port,
         external_ip,
         external_port,
-        remote_ip,
-        remote_port,
+        remote_address,
         lifetime_seconds: header.lifetime_seconds,
         expiration: std::time::Instant::now()
             + Duration::from_secs(u64::from(header.lifetime_seconds)),
         gateway_epoch_seconds: header.gateway_epoch_seconds,
+        timeout_config,
+    })
+}
+
+/// A successful response to a port mapping request.
+struct PortMappingInternal {
+    pub lifetime_seconds: u32,
+    pub gateway_epoch_seconds: u32,
+    pub nonce: Nonce,
+    pub external_port: u16,
+    pub external_ip: IpAddr,
+    pub timeout_config: TimeoutConfig,
+}
+
+/// Helper for attempting a port mapping with more permissive input.
+async fn try_port_mapping_internal(
+    gateway: IpAddr,
+    client: IpAddr,
+    nonce: Option<Nonce>,
+    map_range: MappingRange,
+    lifetime_seconds: Option<u32>,
+    timeout_config: Option<TimeoutConfig>,
+) -> Result<PortMappingInternal, Failure> {
+    // Ensure that a lifetime of `0` is only used for valid delete requests.
+    // See section 15.1, <https://www.rfc-editor.org/rfc/rfc6887#section-15.1>.
+    #[cfg(debug_assertions)]
+    if lifetime_seconds.is_some_and(|l| l == 0)
+        && if let MappingRange::Single {
+            suggested_external_ip,
+            suggested_external_port,
+            ..
+        } = map_range
+        {
+            suggested_external_ip.is_some() || suggested_external_port.is_some()
+        } else {
+            false
+        }
+    {
+        return Err(Failure::ResultCode(ResultCode::MalformedRequest));
+    }
+
+    let timeout_config = timeout_config.unwrap_or(TIMEOUT_CONFIG_DEFAULT);
+
+    // Use an existing session nonce or generate 96 new random bits.
+    let nonce: Nonce = nonce.unwrap_or_else(|| [rand::random(), rand::random(), rand::random()]);
+
+    let PcpResponse { n, mut bb } = try_send_map_request(
+        gateway,
+        client,
+        nonce,
+        map_range,
+        lifetime_seconds.unwrap_or(RECOMMENDED_MAPPING_LIFETIME_SECONDS),
+        timeout_config,
+    )
+    .await?;
+
+    // Validate the response header.
+    let ResponseHeader {
+        lifetime_seconds,
+        gateway_epoch_seconds,
+    } = validate_base_response(&mut bb)?;
+
+    // Ensure we can read the rest of the map response.
+    if n < 60 {
+        let bits = &bb[..n];
+        return Err(Failure::InvalidResponse(format!(
+            "Too few bytes received: {n}, expected 60: {bits:X?}"
+        )));
+    }
+
+    // Validate the mapping response values.
+    validate_nonce(&mut bb, nonce)?;
+    validate_protocol(
+        &mut bb,
+        match map_range {
+            MappingRange::Single { protocol, .. } => Some(protocol),
+            MappingRange::All { protocol, .. } => protocol,
+        },
+    )?;
+    bb.advance(3); // Reserved.
+    let expected_internal_port = if let MappingRange::Single { internal_port, .. } = map_range {
+        internal_port.get()
+    } else {
+        0
+    };
+    validate_port(&mut bb, expected_internal_port).map_err(|r| {
+        Failure::InvalidResponse(format!(
+            "Incorrect internal port {r}, expected {expected_internal_port}"
+        ))
+    })?;
+
+    // The external port assigned to our mapping. The server may not use the suggested port, if present.
+    let external_port = bb.get_u16();
+
+    // The external IP address assigned to our mapping.
+    let external_ip = read_ip6_addr(&mut bb);
+    let external_ip = if let Some(ip) = external_ip.to_ipv4_mapped() {
+        IpAddr::V4(ip)
+    } else {
+        IpAddr::V6(external_ip)
+    };
+
+    Ok(PortMappingInternal {
+        lifetime_seconds,
+        gateway_epoch_seconds,
+        nonce,
+        external_port,
+        external_ip,
         timeout_config,
     })
 }
@@ -479,17 +673,31 @@ struct PcpResponse {
     pub bb: BytesMut,
 }
 
+#[derive(Clone, Copy)]
+enum MappingRange {
+    Single {
+        protocol: InternetProtocol,
+        internal_port: NonZeroU16,
+        suggested_external_port: Option<NonZeroU16>,
+        suggested_external_ip: Option<IpAddr>,
+    },
+    All {
+        protocol: Option<InternetProtocol>,
+        suggested_external_ip: Option<IpAddr>,
+    },
+}
+
 /// Helper function to try to create and send a PCP request and return the gateway's response, if any.
 async fn try_send_map_request(
-    base: BaseMapRequest,
+    gateway: IpAddr,
+    client: IpAddr,
     nonce: Nonce,
-    suggested_external_port: Option<NonZeroU16>,
-    suggested_external_ip: Option<IpAddr>,
+    map_range: MappingRange,
     lifetime_seconds: u32,
     timeout_config: TimeoutConfig,
 ) -> Result<PcpResponse, Failure> {
     // Create a new UDP socket to communicate with the gateway.
-    let socket = helpers::new_socket(base.gateway)
+    let socket = helpers::new_socket(gateway)
         .await
         .map_err(Failure::Socket)?;
 
@@ -499,8 +707,17 @@ async fn try_send_map_request(
     // Write the common PCP request header.
     let suggested_ip = write_base_request(
         OperationCode::Map,
-        base.client,
-        suggested_external_ip,
+        client,
+        match map_range {
+            MappingRange::Single {
+                suggested_external_ip,
+                ..
+            }
+            | MappingRange::All {
+                suggested_external_ip,
+                ..
+            } => suggested_external_ip,
+        },
         &mut bb,
         lifetime_seconds,
     );
@@ -509,10 +726,30 @@ async fn try_send_map_request(
     bb.put_u32(nonce[0]);
     bb.put_u32(nonce[1]);
     bb.put_u32(nonce[2]);
-    bb.put_u8(protocol_to_byte(base.protocol));
+    bb.put_u8(if let MappingRange::Single { protocol, .. } = map_range {
+        protocol_to_byte(protocol)
+    } else {
+        0
+    });
     bb.put(&[0u8; 3][..]); // Reserved.
-    bb.put_u16(base.internal_port);
-    bb.put_u16(suggested_external_port.map_or(0, NonZeroU16::get));
+    bb.put_u16(
+        if let MappingRange::Single { internal_port, .. } = map_range {
+            internal_port.get()
+        } else {
+            0
+        },
+    );
+    bb.put_u16(
+        if let MappingRange::Single {
+            suggested_external_port,
+            ..
+        } = map_range
+        {
+            suggested_external_port.map_or(0, NonZeroU16::get)
+        } else {
+            0
+        },
+    );
     bb.put(&suggested_ip.octets()[..]);
 
     // Send the request to the gateway.
@@ -695,13 +932,95 @@ fn validate_port(bb: &mut bytes::BytesMut, expected_port: u16) -> Result<(), u16
 /// Validate a protocol received.
 fn validate_protocol(
     bb: &mut bytes::BytesMut,
-    expected_protocol: InternetProtocol,
+    expected_protocol: Option<InternetProtocol>,
 ) -> Result<(), Failure> {
     let response_protocol = bb.get_u8();
-    if response_protocol != protocol_to_byte(expected_protocol) {
+    if response_protocol != expected_protocol.map_or(0, protocol_to_byte) {
         return Err(Failure::InvalidResponse(format!(
             "Incorrect protocol {response_protocol}, expected {expected_protocol:?}"
         )));
     }
     Ok(())
+}
+
+impl PeerMapping {
+    #[must_use]
+    pub fn gateway(&self) -> IpAddr {
+        self.gateway
+    }
+    #[must_use]
+    pub fn client(&self) -> IpAddr {
+        self.client
+    }
+    #[must_use]
+    pub fn protocol(&self) -> InternetProtocol {
+        self.protocol
+    }
+    #[must_use]
+    pub fn internal_port(&self) -> NonZeroU16 {
+        self.internal_port
+    }
+    #[must_use]
+    pub fn external_ip(&self) -> IpAddr {
+        self.external_ip
+    }
+    #[must_use]
+    pub fn external_port(&self) -> NonZeroU16 {
+        self.external_port
+    }
+    #[must_use]
+    pub fn remote_address(&self) -> SocketAddr {
+        self.remote_address
+    }
+    #[must_use]
+    pub fn lifetime_seconds(&self) -> u32 {
+        self.lifetime_seconds
+    }
+    #[must_use]
+    pub fn gateway_epoch_seconds(&self) -> u32 {
+        self.gateway_epoch_seconds
+    }
+    #[must_use]
+    pub fn nonce(&self) -> Nonce {
+        self.nonce
+    }
+    #[must_use]
+    pub fn expiration(&self) -> std::time::Instant {
+        self.expiration
+    }
+}
+
+impl PortMappingAllPorts {
+    #[must_use]
+    pub fn gateway(&self) -> IpAddr {
+        self.gateway
+    }
+    #[must_use]
+    pub fn client(&self) -> IpAddr {
+        self.client
+    }
+    #[must_use]
+    pub fn protocol(&self) -> Option<InternetProtocol> {
+        self.protocol
+    }
+    #[must_use]
+    pub fn external_ip(&self) -> IpAddr {
+        self.external_ip
+    }
+    #[must_use]
+    pub fn lifetime_seconds(&self) -> u32 {
+        self.lifetime_seconds
+    }
+    #[must_use]
+    pub fn gateway_epoch_seconds(&self) -> u32 {
+        self.gateway_epoch_seconds
+    }
+    #[must_use]
+    pub fn nonce(&self) -> Nonce {
+        self.nonce
+    }
+    #[must_use]
+    pub fn expiration(&self) -> std::time::Instant {
+        self.expiration
+    }
 }

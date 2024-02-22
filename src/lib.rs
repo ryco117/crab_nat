@@ -120,10 +120,10 @@ pub struct PortMapping {
     protocol: InternetProtocol,
 
     /// The internal/local port of the port mapping.
-    internal_port: u16,
+    internal_port: NonZeroU16,
 
     /// The external port of the port mapping.
-    external_port: u16,
+    external_port: NonZeroU16,
 
     /// The lifetime of the port mapping in seconds.
     lifetime_seconds: u32,
@@ -158,7 +158,7 @@ impl PortMapping {
     ) -> Result<PortMapping, MappingFailure> {
         // Try to use the more modern protocol, PCP, first.
         match pcp::try_port_mapping(
-            pcp::BaseMapRequest::new(gateway, client, protocol, internal_port.get()),
+            pcp::BaseMapRequest::new(gateway, client, protocol, internal_port),
             None,
             None,
             mapping_options,
@@ -176,22 +176,19 @@ impl PortMapping {
         }
 
         // Fall back to the older, possibly more widely supported, NAT-PMP.
-        natpmp::try_port_mapping(gateway, protocol, internal_port.get(), mapping_options)
+        natpmp::try_port_mapping(gateway, protocol, internal_port, mapping_options)
             .await
             .map_err(std::convert::Into::into)
     }
 
     /// Attempts to renew this port mapping on the gateway, otherwise returns an error.
     /// # Errors
-    /// Returns a `MappingFailure` enum which decomposes into different errors depending on the cause:
-    /// * `Socket` if there is an error using the UDP socket
-    /// * `Timeout` if the gateway is not responding
-    /// * `InvalidResponse` if the gateway gave an invalid response
-    /// * `ResultCode` if the gateway gave a valid response, but it was an error. Will never return `ResultCode::Success` as an error.
+    /// Returns a `MappingFailure` enum which decomposes into `NatPmp(natpmp::Failure)` and `Pcp(pcp::Failure)`
+    /// depending on which protocol was used to create the mapping.
     pub async fn try_renew(&mut self) -> Result<(), MappingFailure> {
         // The optional configuration values for the port mapping request.
         let options = PortMappingOptions {
-            external_port: NonZeroU16::new(self.external_port),
+            external_port: Some(self.external_port),
             lifetime_seconds: Some(self.lifetime()),
             timeout_config: Some(self.timeout_config),
         };
@@ -233,11 +230,8 @@ impl PortMapping {
 
     /// Attempts to safely delete this port mapping on the gateway, otherwise returns an error and the `PortMapping` back.
     /// # Errors
-    /// Returns a `MappingFailure` enum which decomposes into different errors depending on the cause:
-    /// * `Socket` if there is an error using the UDP socket
-    /// * `Timeout` if the gateway is not responding
-    /// * `InvalidResponse` if the gateway gave an invalid response
-    /// * `ResultCode` if the gateway gave a valid response, but it was an error. Will never return `ResultCode::Success` as an error.
+    /// Returns a `MappingFailure` enum which decomposes into `NatPmp(natpmp::Failure)` and `Pcp(pcp::Failure)`
+    /// depending on which protocol was used to create the mapping.
     pub async fn try_drop(self) -> Result<(), (MappingFailure, Self)> {
         let gateway = self.gateway();
         let protocol = self.protocol();
@@ -249,20 +243,19 @@ impl PortMapping {
             PortMappingType::NatPmp => natpmp::try_drop_mapping(
                 self.gateway(),
                 self.protocol(),
-                internal_port,
+                Some(internal_port),
                 Some(self.timeout_config),
             )
             .await
             .map_err(|e| (MappingFailure::from(e), self)),
-            PortMappingType::Pcp {
+            PortMappingType::Pcp { client, nonce, .. } => pcp::try_drop_mapping(
+                gateway,
                 client,
                 nonce,
-                external_ip,
-            } => pcp::try_drop_mapping(
-                pcp::BaseMapRequest::new(gateway, client, protocol, internal_port),
-                nonce,
-                external_ip,
-                self.external_port(),
+                pcp::DropMappingRange::Single {
+                    internal_port,
+                    protocol,
+                },
                 Some(self.timeout_config),
             )
             .await
@@ -282,12 +275,12 @@ impl PortMapping {
     }
     /// The internal/local port of the port mapping.
     #[must_use]
-    pub fn internal_port(&self) -> u16 {
+    pub fn internal_port(&self) -> NonZeroU16 {
         self.internal_port
     }
     /// The external port of the port mapping.
     #[must_use]
-    pub fn external_port(&self) -> u16 {
+    pub fn external_port(&self) -> NonZeroU16 {
         self.external_port
     }
     /// The lifetime of the port mapping in seconds.

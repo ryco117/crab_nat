@@ -1,5 +1,6 @@
 use std::{
     net::{IpAddr, Ipv4Addr},
+    num::NonZeroU16,
     time::Duration,
 };
 
@@ -181,11 +182,91 @@ pub async fn try_external_address(
 pub async fn try_port_mapping(
     gateway: IpAddr,
     protocol: InternetProtocol,
-    internal_port: u16,
+    internal_port: NonZeroU16,
     mapping_options: PortMappingOptions,
 ) -> Result<PortMapping, Failure> {
+    let PortMappingInternal {
+        gateway_epoch_seconds,
+        external_port,
+        lifetime_seconds,
+        timeout_config,
+    } = try_port_mapping_internal(gateway, protocol, internal_port.get(), mapping_options).await?;
+    let external_port = NonZeroU16::new(external_port)
+        .ok_or_else(|| Failure::InvalidResponse("Invalid external port of zero".to_owned()))?;
+
+    Ok(PortMapping {
+        gateway,
+        protocol,
+        internal_port,
+        external_port,
+        lifetime_seconds,
+        expiration: std::time::Instant::now() + Duration::from_secs(u64::from(lifetime_seconds)),
+        gateway_epoch_seconds,
+        mapping_type: PortMappingType::NatPmp,
+        timeout_config,
+    })
+}
+
+/// Attempts to remove a NAT-PMP mapping on the gateway.
+/// Using a local port of `None` will remove all port mappings for our client with the given protocol.
+/// # Errors
+/// Returns a `natpmp::Failure` enum which decomposes into different errors depending on the cause:
+/// * `Socket` if there is an error using the UDP socket
+/// * `Timeout` if the gateway is not responding
+/// * `InvalidResponse` if the gateway gave an invalid response
+/// * `ResultCode` if the gateway gave a valid response, but it was an error. Will never return `ResultCode::Success` as an error.
+pub async fn try_drop_mapping(
+    gateway: IpAddr,
+    protocol: InternetProtocol,
+    local_port: Option<NonZeroU16>,
+    timeout_config: Option<TimeoutConfig>,
+) -> Result<(), Failure> {
+    // Mapping deletion is specified by the same operation code and format as mapping creation.
+    // The difference is that the lifetime and external port must be set to `0` and an internal port of `0` will remove all mappings.
+    let PortMappingInternal {
+        external_port,
+        lifetime_seconds,
+        ..
+    } = try_port_mapping_internal(
+        gateway,
+        protocol,
+        local_port.map_or(0, NonZeroU16::get),
+        PortMappingOptions {
+            external_port: None,
+            lifetime_seconds: Some(0),
+            timeout_config,
+        },
+    )
+    .await?;
+
+    // Check that the response is correct for a deletion request.
+    if external_port != 0 || lifetime_seconds != 0 {
+        return Err(Failure::InvalidResponse(format!(
+            "Invalid response to deletion request: {external_port} {lifetime_seconds:?}"
+        )));
+    }
+
+    Ok(())
+}
+
+/// A successful response to a port mapping request.
+struct PortMappingInternal {
+    pub gateway_epoch_seconds: u32,
+    pub external_port: u16,
+    pub lifetime_seconds: u32,
+    pub timeout_config: TimeoutConfig,
+}
+
+/// Helper for attempting a port mapping with more permissive input.
+async fn try_port_mapping_internal(
+    gateway: IpAddr,
+    protocol: InternetProtocol,
+    internal_port: u16,
+    mapping_options: PortMappingOptions,
+) -> Result<PortMappingInternal, Failure> {
     // Ensure that a local port of `0` is only used for valid "delete all" requests.
     // See the last paragraph of section 3.4, <https://www.rfc-editor.org/rfc/rfc6886#section-3.4>.
+    #[cfg(debug_assertions)]
     if internal_port == 0
         && (!mapping_options.lifetime_seconds.is_some_and(|l| l == 0)
             || mapping_options.external_port.is_some())
@@ -256,14 +337,10 @@ pub async fn try_port_mapping(
             "Unsupported version: {v:?}"
         )));
     }
-    let protocol = match (op, op == req_op) {
-        (OperationCode::MapUdp, true) => InternetProtocol::Udp,
-        (OperationCode::MapTcp, true) => InternetProtocol::Tcp,
-        _ => {
-            return Err(Failure::InvalidResponse(format!(
-                "Incorrect opcode: {op:?}"
-            )))
-        }
+    if op != req_op {
+        return Err(Failure::InvalidResponse(format!(
+            "Incorrect opcode: {op:?}"
+        )));
     };
 
     // Read and verify the result code.
@@ -287,60 +364,12 @@ pub async fn try_port_mapping(
     let external_port = bb.get_u16();
     let lifetime_seconds = bb.get_u32();
 
-    Ok(PortMapping {
-        gateway,
-        protocol,
-        internal_port,
+    Ok(PortMappingInternal {
+        gateway_epoch_seconds,
         external_port,
         lifetime_seconds,
-        expiration: std::time::Instant::now() + Duration::from_secs(u64::from(lifetime_seconds)),
-        gateway_epoch_seconds,
-        mapping_type: PortMappingType::NatPmp,
         timeout_config,
     })
-}
-
-/// Attempts to remove a NAT-PMP mapping on the gateway.
-/// Using a local port of `0` will remove all port mappings for our client with the given protocol.
-/// # Errors
-/// Returns a `natpmp::Failure` enum which decomposes into different errors depending on the cause:
-/// * `Socket` if there is an error using the UDP socket
-/// * `Timeout` if the gateway is not responding
-/// * `InvalidResponse` if the gateway gave an invalid response
-/// * `ResultCode` if the gateway gave a valid response, but it was an error. Will never return `ResultCode::Success` as an error.
-pub async fn try_drop_mapping(
-    gateway: IpAddr,
-    protocol: InternetProtocol,
-    local_port: u16,
-    timeout_config: Option<TimeoutConfig>,
-) -> Result<(), Failure> {
-    // Mapping deletion is specified by the same operation code and format as mapping creation.
-    // The difference is that the lifetime and external port must be set to `0`.
-    let PortMapping {
-        internal_port,
-        external_port,
-        lifetime_seconds,
-        ..
-    } = try_port_mapping(
-        gateway,
-        protocol,
-        local_port,
-        PortMappingOptions {
-            external_port: None,
-            lifetime_seconds: Some(0),
-            timeout_config,
-        },
-    )
-    .await?;
-
-    // Check that the response is correct for a deletion request.
-    if internal_port != local_port || external_port != 0 || lifetime_seconds != 0 {
-        return Err(Failure::InvalidResponse(format!(
-            "Invalid response to deletion request: {internal_port} {external_port} {lifetime_seconds:?}"
-        )));
-    }
-
-    Ok(())
 }
 
 /// Response `OperationCode`s are the same as the request `OperationCode`s, but with the 128 bit set.

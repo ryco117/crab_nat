@@ -85,7 +85,7 @@ pub enum PortMappingType {
 }
 
 /// Configuration of the timing of UDP requests to the gateway.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct TimeoutConfig {
     /// The initial timeout for the first request. In general, the timeout will be doubled on each successive retry.
     pub initial_timeout: std::time::Duration,
@@ -112,6 +112,7 @@ pub struct PortMappingOptions {
 }
 
 /// A port mapping on the gateway. Should be renewed with `.try_renew()` and deleted from the gateway with `.try_drop()`.
+#[derive(Clone, Debug)]
 pub struct PortMapping {
     /// The address of the gateway the mapping is registered with.
     gateway: IpAddr,

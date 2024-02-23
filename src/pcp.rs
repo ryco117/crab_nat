@@ -216,6 +216,7 @@ pub async fn try_port_mapping(
 }
 
 /// A port mapping on the gateway using PCP to map all ports to our client through the PCP server.
+#[derive(Clone, Debug)]
 pub struct PortMappingAllPorts {
     /// The address of the gateway the mapping is registered with.
     gateway: IpAddr,
@@ -248,7 +249,6 @@ pub struct PortMappingAllPorts {
 /// Attempts to map all ports on the gateway to the corresponding port on our client using PCP.
 /// If the protocol is `None`, it will try to map all ports for all protocols.
 /// Otherwise, only the specified protocol will be mapped.
-/// The mapping
 /// # Errors
 /// Returns a `pcp::Failure` enum which decomposes into different errors depending on the cause:
 /// * `Socket` if there is an error using the UDP socket.
@@ -372,6 +372,7 @@ pub async fn try_drop_mapping(
 }
 
 /// A mapping to a peer's socket address through the gateway (i.e., the PCP server).
+#[derive(Clone, Debug)]
 pub struct PeerMapping {
     /// The address of the gateway the mapping is registered with.
     gateway: IpAddr,
@@ -421,7 +422,6 @@ pub struct PeerMapping {
 pub async fn try_peer_mapping(
     base: BaseMapRequest,
     session_nonce: Option<Nonce>,
-    suggested_external_port: Option<NonZeroU16>,
     suggested_external_ip: Option<IpAddr>,
     remote_address: SocketAddr,
     mapping_options: PortMappingOptions,
@@ -463,7 +463,7 @@ pub async fn try_peer_mapping(
     bb.put_u8(protocol_to_byte(base.protocol));
     bb.put(&[0u8; 3][..]); // Reserved.
     bb.put_u16(base.internal_port.get());
-    bb.put_u16(suggested_external_port.map_or(0, NonZeroU16::get));
+    bb.put_u16(mapping_options.external_port.map_or(0, NonZeroU16::get));
     bb.put(&suggested_ip.octets()[..]);
     bb.put_u16(remote_port);
     bb.put_u16(0); // Reserved.
@@ -944,6 +944,57 @@ fn validate_protocol(
 }
 
 impl PeerMapping {
+    /// Attempts to renew this peer mapping on the gateway, otherwise returns an error.
+    /// # Errors
+    /// Returns a `pcp::Failure` enum which decomposes into different errors depending on the cause:
+    /// * `Socket` if there is an error using the UDP socket.
+    /// * `Timeout` if the gateway is not responding.
+    /// * `Nonce` if the gateway gave a nonce we weren't expecting.
+    /// * `InvalidResponse` if the gateway gave an invalid response.
+    /// * `ResultCode` if the gateway gave a valid response, but it was an error. Will never return `ResultCode::Success` as an error.
+    pub async fn try_renew(&mut self) -> Result<(), Failure> {
+        // Attempt to renew the existing port mapping on the gateway.
+        *self = try_peer_mapping(
+            BaseMapRequest::new(self.gateway, self.client, self.protocol, self.internal_port),
+            Some(self.nonce),
+            Some(self.external_ip),
+            self.remote_address,
+            PortMappingOptions {
+                external_port: Some(self.external_port),
+                lifetime_seconds: Some(self.lifetime_seconds),
+                timeout_config: Some(self.timeout_config),
+            },
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Attempts to safely delete this peer mapping on the gateway, otherwise returns an error and the `PeerMapping` back.
+    /// # Errors
+    /// Returns a `pcp::Failure` enum which decomposes into different errors depending on the cause:
+    /// * `Socket` if there is an error using the UDP socket.
+    /// * `Timeout` if the gateway is not responding.
+    /// * `Nonce` if the gateway gave a nonce we weren't expecting.
+    /// * `InvalidResponse` if the gateway gave an invalid response.
+    /// * `ResultCode` if the gateway gave a valid response, but it was an error. Will never return `ResultCode::Success` as an error.
+    pub async fn try_drop(self) -> Result<(), (Failure, Self)> {
+        // Attempt to drop the existing port mapping on the gateway.
+        try_peer_mapping(
+            BaseMapRequest::new(self.gateway, self.client, self.protocol, self.internal_port),
+            Some(self.nonce),
+            None,
+            self.remote_address,
+            PortMappingOptions {
+                external_port: None,
+                lifetime_seconds: Some(0),
+                timeout_config: Some(self.timeout_config),
+            },
+        )
+        .await
+        .map_err(|e| (e, self))
+        .map(std::mem::drop)
+    }
+
     #[must_use]
     pub fn gateway(&self) -> IpAddr {
         self.gateway
@@ -991,6 +1042,52 @@ impl PeerMapping {
 }
 
 impl PortMappingAllPorts {
+    /// Attempts to renew this port mapping on the gateway, otherwise returns an error.
+    /// # Errors
+    /// Returns a `pcp::Failure` enum which decomposes into different errors depending on the cause:
+    /// * `Socket` if there is an error using the UDP socket.
+    /// * `Timeout` if the gateway is not responding.
+    /// * `Nonce` if the gateway gave a nonce we weren't expecting.
+    /// * `InvalidResponse` if the gateway gave an invalid response.
+    /// * `ResultCode` if the gateway gave a valid response, but it was an error. Will never return `ResultCode::Success` as an error.
+    pub async fn try_renew(&mut self) -> Result<(), Failure> {
+        // Attempt to renew the existing port mapping on the gateway.
+        *self = try_port_mapping_all_ports(
+            self.gateway,
+            self.client,
+            self.protocol,
+            Some(self.nonce),
+            Some(self.external_ip),
+            Some(self.lifetime_seconds),
+            Some(self.timeout_config),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Attempts to safely delete this port mapping on the gateway, otherwise returns an error and the `PortMapping` back.
+    /// # Errors
+    /// Returns a `pcp::Failure` enum which decomposes into different errors depending on the cause:
+    /// * `Socket` if there is an error using the UDP socket.
+    /// * `Timeout` if the gateway is not responding.
+    /// * `Nonce` if the gateway gave a nonce we weren't expecting.
+    /// * `InvalidResponse` if the gateway gave an invalid response.
+    /// * `ResultCode` if the gateway gave a valid response, but it was an error. Will never return `ResultCode::Success` as an error.
+    pub async fn try_drop(self) -> Result<(), (Failure, Self)> {
+        // Attempt to drop the existing port mapping on the gateway.
+        try_drop_mapping(
+            self.gateway,
+            self.client,
+            self.nonce,
+            DropMappingRange::All {
+                protocol: self.protocol,
+            },
+            Some(self.timeout_config),
+        )
+        .await
+        .map_err(|e| (e, self))
+    }
+
     #[must_use]
     pub fn gateway(&self) -> IpAddr {
         self.gateway

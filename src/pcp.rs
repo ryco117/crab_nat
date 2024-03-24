@@ -15,7 +15,8 @@ use crate::{
 
 /// The RFC states that the first response timeout "SHOULD be 3 seconds."
 /// <https://www.rfc-editor.org/rfc/rfc6887#section-8.1.1>
-pub const FIRST_TIMEOUT_SECONDS: u64 = 3;
+/// However, this can be very long for modern applications. Using 1 second as a compromise.
+pub const FIRST_TIMEOUT_SECONDS: u64 = 1;
 
 /// The RFC states that the maximum response timeout "SHOULD be 1024 seconds."
 /// <https://www.rfc-editor.org/rfc/rfc6887#section-8.1.1>

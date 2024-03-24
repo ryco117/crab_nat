@@ -38,6 +38,9 @@ async fn main() {
     use clap::Parser as _;
     let args = Cli::parse();
 
+    // Initialize the default logger. This is optional to use the crate and currently only shows UDP retry attempts.
+    tracing_subscriber::fmt::init();
+
     // Get the protocol from the command line or use the default.
     let protocol = match args.internet_protocol.to_lowercase().as_str().trim() {
         "udp" => crab_nat::InternetProtocol::Udp,
@@ -53,7 +56,7 @@ async fn main() {
     } else {
         args.gateway.parse().expect("Invalid gateway format")
     };
-    println!("Using gateway address: {gateway:#}");
+    tracing::info!("Using gateway address: {gateway:#}");
 
     let local_address = if args.local_address.is_empty() {
         default_net::interface::get_local_ipaddr().expect("Could not determine a local address")
@@ -62,15 +65,15 @@ async fn main() {
             .parse()
             .expect("Invalid local address format")
     };
-    println!("Using local address: {local_address:#}");
+    tracing::info!("Using local address: {local_address:#}");
 
     // If the external IP flag is set, attempt to get the external IP and exit.
     if args.external_ip {
         let external_ip = match crab_nat::natpmp::try_external_address(gateway, None).await {
             Ok(ip) => ip,
-            Err(e) => return eprintln!("Failed to get external IP: {e:#}"),
+            Err(e) => return tracing::error!("Failed to get external IP: {e:#}"),
         };
-        return println!("External IP: {external_ip:#}");
+        return tracing::info!("External IP: {external_ip:#}");
     }
 
     if args.delete {
@@ -83,11 +86,11 @@ async fn main() {
         )
         .await
         {
-            return eprintln!("Failed to unmap port: {e:#}");
+            return tracing::error!("Failed to unmap port: {e:#}");
         }
 
         // Print the mapped port information.
-        println!("Success! Deleted previous port mapping");
+        tracing::info!("Success! Deleted previous port mapping");
     } else {
         // Attempt a port mapping request.
         let mapping = match crab_nat::PortMapping::new(
@@ -103,7 +106,7 @@ async fn main() {
         .await
         {
             Ok(m) => m,
-            Err(e) => return eprintln!("Failed to map port: {e:#}"),
+            Err(e) => return tracing::error!("Failed to map port: {e:#}"),
         };
         let protocol = mapping.protocol();
         let external_port = mapping.external_port();
@@ -112,17 +115,17 @@ async fn main() {
         let mapping_type = mapping.mapping_type();
 
         // Print the mapped port information.
-        println!("Successfully mapped protocol {protocol:?} on external port {external_port} to internal port {internal_port} with a lifetime of {lifetime:?} using {mapping_type:?}");
+        tracing::info!("Successfully mapped protocol {protocol:?} on external port {external_port} to internal port {internal_port} with a lifetime of {lifetime:?} using {mapping_type:?}");
 
         // Try to safely drop the mapping.
         if let Err((e, m)) = mapping.try_drop().await {
-            eprintln!(
+            tracing::error!(
                 "Failed to drop mapping {protocol:?} {gateway}:{}->{}: {e:?}",
                 m.external_port(),
                 m.internal_port()
             );
         } else {
-            println!("Successfully deleted the mapping...");
+            tracing::info!("Successfully deleted the mapping...");
         }
     }
 }

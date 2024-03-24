@@ -405,8 +405,9 @@ mod helpers {
                     // PCP specifies that fuzzing be done after applying the maximum timeout, to avoid synchronization issues.
                     fuzz_timeout(wait);
 
-                    #[cfg(debug_assertions)]
-                    println!("DEBUG: crab_nat: Starting retry {retries}/{max_retries} with timeout {wait:?}");
+                    // Optionally log retry attempts to tracing.
+                    #[cfg(feature = "tracing")]
+                    tracing::info!("Starting retry {retries}/{max_retries} with timeout {wait:?}");
                 }
 
                 // Any other error is returned immediately.

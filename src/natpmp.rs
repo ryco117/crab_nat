@@ -20,7 +20,7 @@ pub const FIRST_TIMEOUT_MILLIS: u64 = 250;
 pub const MAX_DATAGRAM_SIZE: usize = 16;
 
 /// The default `TimeoutConfig` for NAT-PMP requests.
-const TIMEOUT_CONFIG_DEFAULT: TimeoutConfig = TimeoutConfig {
+pub const TIMEOUT_CONFIG_DEFAULT: TimeoutConfig = TimeoutConfig {
     initial_timeout: Duration::from_millis(FIRST_TIMEOUT_MILLIS),
     max_retries: SANE_MAX_REQUEST_RETRIES,
     max_retry_timeout: None,

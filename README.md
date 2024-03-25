@@ -5,7 +5,7 @@ A library providing a pure Rust implementation of a client for both the NAT Port
 This library is intended to feel like high level, idiomatic Rust, while still maintaining a strong focus on performance. It is asynchronous and uses the [tokio](https://tokio.rs) runtime to avoid blocking operations and to succinctly handle timeouts on UDP sockets.
 
 ## Usage
-If there isn't a preference on which port mapping protocol is used or what the external port should be, usage looks as follows:
+If there isn't a preference on which port mapping protocol is used or what the external port should be, etc., then usage looks as follows:
 ```rust
 // Attempt a port mapping request through PCP first and fallback to NAT-PMP.
 let mapping = match crab_nat::PortMapping::new(

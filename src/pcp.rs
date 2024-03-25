@@ -15,7 +15,7 @@ use crate::{
 
 /// The RFC states that the first response timeout "SHOULD be 3 seconds."
 /// <https://www.rfc-editor.org/rfc/rfc6887#section-8.1.1>
-/// However, this can be very long for modern applications. Using 1 second as a compromise.
+/// However, this can be very long for modern applications. Using a 1 second default as a compromise.
 pub const FIRST_TIMEOUT_SECONDS: u64 = 1;
 
 /// The RFC states that the maximum response timeout "SHOULD be 1024 seconds."
@@ -26,7 +26,7 @@ pub const MAX_TIMEOUT_SECONDS: u64 = 1024;
 pub const MAX_DATAGRAM_SIZE: usize = 1100;
 
 /// The default `TimeoutConfig` for PCP requests.
-const TIMEOUT_CONFIG_DEFAULT: TimeoutConfig = TimeoutConfig {
+pub const TIMEOUT_CONFIG_DEFAULT: TimeoutConfig = TimeoutConfig {
     initial_timeout: Duration::from_secs(FIRST_TIMEOUT_SECONDS),
     max_retries: SANE_MAX_REQUEST_RETRIES,
     max_retry_timeout: Some(Duration::from_secs(MAX_TIMEOUT_SECONDS)),

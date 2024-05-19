@@ -31,7 +31,7 @@ if let Err((e, m)) = mapping.try_drop().await {
 }
 ```
 
-Crab NAT does not determine the gateway address or the local client address. This is to reduce unnecessary assumptions about how this library will be used. For an easy API to determine these values reliably, I recommend using [default-net](https://crates.io/crates/default-net); see the example [client](examples/client.rs) for basic usage.
+Crab NAT does not determine the gateway address or the local client address. This is to reduce unnecessary assumptions about how this library will be used. For an easy API to determine these values reliably, I recommend using [netdev](https://crates.io/crates/netdev); see the example [client](examples/client.rs) for basic usage.
 
 ### Crate Features
 * `tracing`: Enables logging of UDP packet retry attempts using the [tracing](https://github.com/tokio-rs/tracing) crate. This currently only shows UDP retry attempts at an `INFO` verbosity level.

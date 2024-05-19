@@ -1,4 +1,4 @@
-use std::num::NonZeroU16;
+use std::{net::IpAddr, num::NonZeroU16};
 
 use crab_nat::PortMappingOptions;
 
@@ -48,24 +48,49 @@ async fn main() {
         _ => panic!("Invalid protocol"),
     };
 
-    // Get the gateway address from the command line or guess the default.
-    let gateway = if args.gateway.is_empty() {
-        default_net::get_default_gateway()
-            .expect("Could not determine a gateway")
-            .ip_addr
-    } else {
-        args.gateway.parse().expect("Invalid gateway format")
-    };
-    tracing::info!("Using gateway address: {gateway:#}");
-
     let local_address = if args.local_address.is_empty() {
-        default_net::interface::get_local_ipaddr().expect("Could not determine a local address")
+        netdev::interface::get_local_ipaddr().expect("Could not determine a local address")
     } else {
         args.local_address
             .parse()
             .expect("Invalid local address format")
     };
     tracing::info!("Using local address: {local_address:#}");
+
+    // Get the gateway address from the command line or guess the default.
+    let gateway = if args.gateway.is_empty() {
+        let gateway = netdev::get_default_gateway().expect("Could not determine a gateway");
+        if local_address.is_ipv4() {
+            gateway
+                .ipv4
+                .first()
+                .map(|ip| IpAddr::V4(*ip))
+                .unwrap_or_else(|| {
+                    IpAddr::V6(
+                        *gateway
+                            .ipv6
+                            .first()
+                            .expect("No addresses found for default gateway"),
+                    )
+                })
+        } else {
+            gateway
+                .ipv6
+                .first()
+                .map(|ip| IpAddr::V6(*ip))
+                .unwrap_or_else(|| {
+                    IpAddr::V4(
+                        *gateway
+                            .ipv4
+                            .first()
+                            .expect("No addresses found for default gateway"),
+                    )
+                })
+        }
+    } else {
+        args.gateway.parse().expect("Invalid gateway format")
+    };
+    tracing::info!("Using gateway address: {gateway:#}");
 
     // If the external IP flag is set, attempt to get the external IP and exit.
     if args.external_ip {

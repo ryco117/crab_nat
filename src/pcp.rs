@@ -32,7 +32,7 @@ pub const TIMEOUT_CONFIG_DEFAULT: TimeoutConfig = TimeoutConfig {
     max_retry_timeout: Some(Duration::from_secs(MAX_TIMEOUT_SECONDS)),
 };
 
-/// A unqie session identifier for a PCP client.
+/// A unique session identifier for a PCP client.
 pub type Nonce = [u32; 3];
 
 /// Valid result codes from a PCP response.
@@ -113,8 +113,12 @@ pub enum Failure {
     #[error("Invalid response: {0}")]
     InvalidResponse(String),
 
+    /// The gateway gave a version-mismatch response with a closest supported version.
+    #[error("Unsupported version request. Closest supported version: {0}")]
+    UnsupportedVersion(u8),
+
     /// The gateway gave a valid response, but it was an error.
-    /// The `ResultCode` is guaranteed to not be `ResultCode::Success`.
+    /// The `ResultCode` is guaranteed to neither be `ResultCode::Success` nor `ResultCode::UnsupportedVersion`.
     #[error("Gateway error: {0}")]
     ResultCode(ResultCode),
 }
@@ -161,6 +165,7 @@ impl BaseMapRequest {
 /// * `Timeout` if the gateway is not responding.
 /// * `Nonce` if the gateway gave a nonce we weren't expecting.
 /// * `InvalidResponse` if the gateway gave an invalid response.
+/// * `UnsupportedVersion` if the gateway does not support the PCP protocol.
 /// * `ResultCode` if the gateway gave a valid response, but it was an error. Will never return `ResultCode::Success` as an error.
 pub async fn try_port_mapping(
     base: BaseMapRequest,
@@ -256,6 +261,7 @@ pub struct PortMappingAllPorts {
 /// * `Timeout` if the gateway is not responding.
 /// * `Nonce` if the gateway gave a nonce we weren't expecting.
 /// * `InvalidResponse` if the gateway gave an invalid response.
+/// * `UnsupportedVersion` if the gateway does not support the PCP protocol.
 /// * `ResultCode` if the gateway gave a valid response, but it was an error. Will never return `ResultCode::Success` as an error.
 pub async fn try_port_mapping_all_ports(
     gateway: IpAddr,
@@ -323,6 +329,7 @@ pub enum DropMappingRange {
 /// * `Timeout` if the gateway is not responding.
 /// * `Nonce` if the gateway gave a nonce we weren't expecting.
 /// * `InvalidResponse` if the gateway gave an invalid response.
+/// * `UnsupportedVersion` if the gateway does not support the PCP protocol.
 /// * `ResultCode` if the gateway gave a valid response, but it was an error. Will never return `ResultCode::Success` as an error.
 pub async fn try_drop_mapping(
     gateway: IpAddr,
@@ -419,6 +426,7 @@ pub struct PeerMapping {
 /// * `Timeout` if the gateway is not responding.
 /// * `Nonce` if the gateway gave a nonce we weren't expecting.
 /// * `InvalidResponse` if the gateway gave an invalid response.
+/// * `UnsupportedVersion` if the gateway does not support the PCP protocol.
 /// * `ResultCode` if the gateway gave a valid response, but it was an error. Will never return `ResultCode::Success` as an error.
 pub async fn try_peer_mapping(
     base: BaseMapRequest,
@@ -784,7 +792,7 @@ fn write_base_request(
     lifetime_seconds: u32,
 ) -> Ipv6Addr {
     // PCP addresses are always specified as 128 bit addresses, <https://www.rfc-editor.org/rfc/rfc6887#section-5>.
-    // We need to map `Ipv4Addr` to an `Ipv6Addr` accoriding to RFC4291 <https://www.rfc-editor.org/rfc/rfc4291>.
+    // We need to map `Ipv4Addr` to an `Ipv6Addr` according to RFC4291 <https://www.rfc-editor.org/rfc/rfc4291>.
     let (client_ip6, suggested_external_ip6) = match client {
         IpAddr::V4(v4) => (
             v4.to_ipv6_mapped(),
@@ -810,21 +818,40 @@ fn write_base_request(
 /// Helper function to validate the response from a PCP request. Only validates the first 24 bytes, i.e., the header.
 fn validate_base_response(bb: &mut bytes::BytesMut) -> Result<ResponseHeader, Failure> {
     // All valid PCP responses have at least 24 bytes, see <https://www.rfc-editor.org/rfc/rfc6887#section-8.3>, page 26.
-    if bb.len() < 24 {
-        let n = bb.len();
-        let bits = &bb[..n];
+    let n = bb.len();
+    if n < 24 {
+        let header_bytes = &bb[..n];
 
-        // Check if the resposne header matches a `natpmp::ResultCode::UnsupportedVersion` since older devices may not support PCP.
-        if n >= 4
-            && bits[0] == 0
-            && crate::natpmp::ResultCode::try_from((u16::from(bits[2]) << 8) + u16::from(bits[3]))
+        if n >= 4 {
+            let version = header_bytes[0];
+
+            // Check if the response header matches a `natpmp::ResultCode::UnsupportedVersion` since older devices may not support PCP.
+            if version == 0
+                && crate::natpmp::ResultCode::try_from(
+                    (u16::from(header_bytes[2]) << 8) + u16::from(header_bytes[3]),
+                )
                 .is_ok_and(|r| r == crate::natpmp::ResultCode::UnsupportedVersion)
-        {
-            return Err(Failure::ResultCode(ResultCode::UnsupportedVersion));
+            {
+                return Err(Failure::UnsupportedVersion(0));
+            }
+
+            // Check if it matches the more general PCP version (where the third byte is reserved).
+            if ResultCode::try_from(header_bytes[3])
+                .is_ok_and(|r| r == ResultCode::UnsupportedVersion)
+            {
+                return Err(Failure::UnsupportedVersion(version));
+            }
         }
 
         return Err(Failure::InvalidResponse(format!(
-            "Too few bytes received: {bits:X?}"
+            "Too few bytes received: {header_bytes:X?}"
+        )));
+    }
+
+    // PCP responses are always a multiple of 4 bytes, see <https://www.rfc-editor.org/rfc/rfc6887#section-8.3>, page 26.
+    if n % 4 != 0 {
+        return Err(Failure::InvalidResponse(format!(
+            "Invalid response length. Expected a multiple of 4, got: {n}"
         )));
     }
 
@@ -870,12 +897,11 @@ fn opcode_to_request(op: OperationCode) -> u8 {
 }
 
 /// Response `OperationCode` bits are the same as the request `OperationCode`s, but with the `1` bit set.
-/// This function subtracts the `1` from the response bits, right shifts to align with the 7 bit abstract `OperationCode`,
-/// and attempts to parse as an `OperationCode`.
+/// This function right shifts to align with the 7 bit code and attempts to parse as an `OperationCode`.
 fn response_to_opcode(
     op: u8,
 ) -> Result<OperationCode, num_enum::TryFromPrimitiveError<OperationCode>> {
-    OperationCode::try_from((op - 1) >> 1)
+    OperationCode::try_from(op >> 1)
 }
 
 /// Convert the `InternetProtocol` enum into the byte expected by the PCP protocol.
@@ -898,7 +924,7 @@ fn fixed_size_addr(ip: IpAddr) -> Ipv6Addr {
 
 /// Read an `Ipv6Addr` from the given `BytesMut`.
 /// # Panics
-/// This function panics if there is not enough remaining data in self to read the `Ipv6Addr`.
+/// This function panics if there is not enough remaining data in `bb` to read the `Ipv6Addr`.
 fn read_ip6_addr(bb: &mut bytes::BytesMut) -> Ipv6Addr {
     Ipv6Addr::new(
         bb.get_u16(),
@@ -952,6 +978,7 @@ impl PeerMapping {
     /// * `Timeout` if the gateway is not responding.
     /// * `Nonce` if the gateway gave a nonce we weren't expecting.
     /// * `InvalidResponse` if the gateway gave an invalid response.
+    /// * `UnsupportedVersion` if the gateway does not support the PCP protocol.
     /// * `ResultCode` if the gateway gave a valid response, but it was an error. Will never return `ResultCode::Success` as an error.
     pub async fn try_renew(&mut self) -> Result<(), Failure> {
         // Attempt to renew the existing port mapping on the gateway.
@@ -977,6 +1004,7 @@ impl PeerMapping {
     /// * `Timeout` if the gateway is not responding.
     /// * `Nonce` if the gateway gave a nonce we weren't expecting.
     /// * `InvalidResponse` if the gateway gave an invalid response.
+    /// * `UnsupportedVersion` if the gateway does not support the PCP protocol.
     /// * `ResultCode` if the gateway gave a valid response, but it was an error. Will never return `ResultCode::Success` as an error.
     pub async fn try_drop(self) -> Result<(), (Failure, Self)> {
         // Attempt to drop the existing port mapping on the gateway.
@@ -1050,6 +1078,7 @@ impl PortMappingAllPorts {
     /// * `Timeout` if the gateway is not responding.
     /// * `Nonce` if the gateway gave a nonce we weren't expecting.
     /// * `InvalidResponse` if the gateway gave an invalid response.
+    /// * `UnsupportedVersion` if the gateway does not support the PCP protocol.
     /// * `ResultCode` if the gateway gave a valid response, but it was an error. Will never return `ResultCode::Success` as an error.
     pub async fn try_renew(&mut self) -> Result<(), Failure> {
         // Attempt to renew the existing port mapping on the gateway.
@@ -1073,6 +1102,7 @@ impl PortMappingAllPorts {
     /// * `Timeout` if the gateway is not responding.
     /// * `Nonce` if the gateway gave a nonce we weren't expecting.
     /// * `InvalidResponse` if the gateway gave an invalid response.
+    /// * `UnsupportedVersion` if the gateway does not support the PCP protocol.
     /// * `ResultCode` if the gateway gave a valid response, but it was an error. Will never return `ResultCode::Success` as an error.
     pub async fn try_drop(self) -> Result<(), (Failure, Self)> {
         // Attempt to drop the existing port mapping on the gateway.

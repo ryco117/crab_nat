@@ -178,7 +178,6 @@ pub async fn try_external_address(
 /// * `Timeout` if the gateway is not responding
 /// * `InvalidResponse` if the gateway gave an invalid response
 /// * `ResultCode` if the gateway gave a valid response, but it was an error. Will never return `ResultCode::Success` as an error.
-/// Also, if the `internal_port` is `0` and the `lifetime_seconds` is not `Some(0)` or the `external_port` is not `None`, will return `ResultCode::NotAuthorized`.
 pub async fn try_port_mapping(
     gateway: IpAddr,
     protocol: InternetProtocol,
@@ -268,7 +267,7 @@ async fn try_port_mapping_internal(
     // See the last paragraph of section 3.4, <https://www.rfc-editor.org/rfc/rfc6886#section-3.4>.
     #[cfg(debug_assertions)]
     if internal_port == 0
-        && (!mapping_options.lifetime_seconds.is_some_and(|l| l == 0)
+        && (mapping_options.lifetime_seconds.is_some_and(|l| l > 0)
             || mapping_options.external_port.is_some())
     {
         return Err(Failure::ResultCode(ResultCode::NotAuthorized));
@@ -373,9 +372,9 @@ async fn try_port_mapping_internal(
 }
 
 /// Response `OperationCode`s are the same as the request `OperationCode`s, but with the 128 bit set.
-/// This function subtracts the `128` from the response code and returns the result.
+/// This function bit masks the `128` bit from the response code and returns the result.
 fn response_to_opcode(
     op: u8,
 ) -> Result<OperationCode, num_enum::TryFromPrimitiveError<OperationCode>> {
-    OperationCode::try_from(op - 128)
+    OperationCode::try_from(op & 0x7F)
 }

@@ -5,16 +5,16 @@ use crab_nat::PortMappingOptions;
 #[derive(clap::Parser)]
 struct Cli {
     /// Delete the port mapping instead of creating one.
-    #[arg(short, long, default_value_t = false)]
+    #[arg(short, long)]
     delete: bool,
 
-    /// The gateway address to use. If empty, will attempt to determine the default gateway.
-    #[arg(short, long, default_value = "")]
-    gateway: String,
+    /// The gateway address to use. If empty, will attempt to determine a default gateway.
+    #[arg(short, long)]
+    gateway: Option<String>,
 
-    /// The local address the gateway will expect to see our address as. If empty, will attempt to use the default local address.
-    #[arg(short, long, default_value = "")]
-    local_address: String,
+    /// The local address the gateway will expect to see our address as. If empty, will attempt to determine a default network address.
+    #[arg(short, long)]
+    local_address: Option<String>,
 
     /// The internal port to map into.
     #[arg(short = 'p', long, default_value_t = 8080)]
@@ -28,7 +28,7 @@ struct Cli {
     #[arg(short = 'x', long)]
     external_ip: bool,
 
-    /// The protocol to map.
+    /// The protocol to map. Either "tcp" or "udp".
     #[arg(short, long, default_value = "tcp")]
     internet_protocol: String,
 }
@@ -48,18 +48,21 @@ async fn main() {
         _ => panic!("Invalid protocol"),
     };
 
-    let local_address = if args.local_address.is_empty() {
-        netdev::interface::get_local_ipaddr().expect("Could not determine a local address")
+    let local_address = if let Some(address) = args.local_address {
+        address.parse().expect("Invalid local address format")
     } else {
-        args.local_address
-            .parse()
-            .expect("Invalid local address format")
+        netdev::interface::get_local_ipaddr().expect("Could not determine a local address")
     };
     tracing::info!("Using local address: {local_address:#}");
 
     // Get the gateway address from the command line or guess the default.
-    let gateway = if args.gateway.is_empty() {
+    let gateway = if let Some(gateway) = args.gateway {
+        gateway.parse().expect("Invalid gateway format")
+    } else {
+        // Attempt to get a sensible default gateway.
         let gateway = netdev::get_default_gateway().expect("Could not determine a gateway");
+
+        // Attempt to get a gateway address matching the IP version of the local address.
         if local_address.is_ipv4() {
             gateway
                 .ipv4
@@ -87,8 +90,6 @@ async fn main() {
                     )
                 })
         }
-    } else {
-        args.gateway.parse().expect("Invalid gateway format")
     };
     tracing::info!("Using gateway address: {gateway:#}");
 

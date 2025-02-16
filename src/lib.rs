@@ -146,8 +146,8 @@ impl PortMapping {
     /// Will request to use the given external port if specified, otherwise it will let the gateway choose.
     /// If no lifetime is specified, the NAT-PMP recommended lifetime of two hours will be used.
     /// # Errors
-    /// Returns a `MappingFailure` enum which decomposes into `NatPmp(natpmp::Failure)` and `Pcp(pcp::Failure)` depending on which failed.
-    /// Will never return `Pcp(pcp::Failure::ResultCode(pcp::ResultCode::UnsupportedVersion))` because NAT-PMP will be used as a fallback in this case.
+    /// Returns a `MappingFailure` enum which decomposes into a `NatPmp(natpmp::Failure)` or a `Pcp(pcp::Failure)` depending on which failed.
+    /// Will never return `Pcp(pcp::Failure::UnsupportedVersion(0))` because NAT-PMP will be used as a fallback in this case.
     /// If a different `Pcp(_)` error is returned, then NAT-PMP is likely not supported by the gateway and this call will not attempt it.
     /// If you want to still attempt NAT-PMP after PCP fails for unknown reasons, you can call `natpmp::try_port_mapping(..)` directly.
     pub async fn new(
@@ -157,7 +157,7 @@ impl PortMapping {
         internal_port: NonZeroU16,
         mapping_options: PortMappingOptions,
     ) -> Result<PortMapping, MappingFailure> {
-        // Try to use the more modern protocol, PCP, first.
+        // Try to use PCP first, as recommended by the RFC in the last paragraph of section 1.1 <https://www.rfc-editor.org/rfc/rfc6886#page-5>.
         match pcp::try_port_mapping(
             pcp::BaseMapRequest::new(gateway, client, protocol, internal_port),
             None,
@@ -169,8 +169,8 @@ impl PortMapping {
             // If we succeed, return the mapping.
             Ok(m) => return Ok(m),
 
-            // If the gateway does not support PCP, fall back to NAT-PMP.
-            Err(pcp::Failure::ResultCode(pcp::ResultCode::UnsupportedVersion)) => {}
+            // If the gateway does not support PCP, but is recommending version `0` (NAT-PMP) then fall back silently.
+            Err(pcp::Failure::UnsupportedVersion(v)) if v == VersionCode::NatPmp as u8 => {}
 
             // Otherwise, return the error.
             Err(e) => return Err(e.into()),
@@ -184,7 +184,7 @@ impl PortMapping {
 
     /// Attempts to renew this port mapping on the gateway, otherwise returns an error.
     /// # Errors
-    /// Returns a `MappingFailure` enum which decomposes into `NatPmp(natpmp::Failure)` and `Pcp(pcp::Failure)`
+    /// Returns a `MappingFailure` enum which decomposes into a `NatPmp(natpmp::Failure)` or a `Pcp(pcp::Failure)`
     /// depending on which protocol was used to create the mapping.
     pub async fn try_renew(&mut self) -> Result<(), MappingFailure> {
         // The optional configuration values for the port mapping request.
@@ -308,7 +308,7 @@ impl PortMapping {
 
 /// Private module for shared helper functions within the library.
 mod helpers {
-    use std::time::Duration;
+    use std::{net::IpAddr, time::Duration};
 
     use tokio::net::UdpSocket;
 
@@ -317,17 +317,13 @@ mod helpers {
     /// Create a new UDP socket and connect it to the gateway socket address for NAT-PMP or PCP.
     /// # Errors
     /// Will return an error if we fail to bind to a local UDP socket or connect to the gateway address.
-    pub async fn new_socket(
-        gateway: std::net::IpAddr,
-    ) -> Result<tokio::net::UdpSocket, std::io::Error> {
+    pub async fn new_socket(gateway: IpAddr) -> Result<tokio::net::UdpSocket, std::io::Error> {
         use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
         // Create a new UDP with an IP protocol matching that of the gateway address.
-        let socket = tokio::net::UdpSocket::bind(if gateway.is_ipv4() {
-            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))
-        } else {
-            // The Rust standard library uses `0` as the `flowinfo` and `scope_id` for an `Ipv6Addr` created from an address and port number.
-            SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0))
+        let socket = tokio::net::UdpSocket::bind(match &gateway {
+            IpAddr::V4(_) => SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)),
+            IpAddr::V6(_) => SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0)),
         })
         .await?;
         socket.connect((gateway, crate::GATEWAY_PORT)).await?;

@@ -508,8 +508,8 @@ pub async fn peer_mapping(
 
     // PCP Requires a random value in [0.9, 1.1] be multiplied by the timeout.
     // <https://www.rfc-editor.org/rfc/rfc6887#section-8.1.1> Expands on PCP timing in detail.
-    let dist = rand::distributions::Uniform::new(0.9, 1.1);
-    let fuzz_timeout = |wait: Duration| wait.mul_f64(rand::thread_rng().sample(dist));
+    let dist = rand::distr::Uniform::try_from(0.9..=1.1).expect("Failed to initialize uniform distribution");
+    let fuzz_timeout = |wait: Duration| wait.mul_f64(rand::rng().sample(dist));
 
     // Try to get a response from the gateway.
     let n =
@@ -803,8 +803,8 @@ async fn try_send_map_request(
 
     // PCP Requires a random value in [0.9, 1.1] be multiplied by the timeout.
     // <https://www.rfc-editor.org/rfc/rfc6887#section-8.1.1> Expands on PCP timing in detail.
-    let dist = rand::distributions::Uniform::new(0.9, 1.1);
-    let fuzz_timeout = |wait: Duration| wait.mul_f64(rand::thread_rng().sample(dist));
+    let dist = rand::distr::Uniform::try_from(0.9..=1.1).expect("Failed to initialize uniform distribution");
+    let fuzz_timeout = |wait: Duration| wait.mul_f64(rand::rng().sample(dist));
 
     let n =
         helpers::try_send_until_response(timeout_config, &socket, &request, &mut bb, fuzz_timeout)

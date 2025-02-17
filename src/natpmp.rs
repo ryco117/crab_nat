@@ -373,7 +373,7 @@ async fn port_mapping_internal(
         )));
     }
 
-    // Validate that the response corresponds to the reqeusted internal port.
+    // Validate that the response corresponds to the requested internal port.
     let response_internal_port = bb.get_u16();
     if response_internal_port != internal_port {
         return Err(Failure::InvalidResponse(format!(

@@ -2,11 +2,16 @@ use std::{net::IpAddr, num::NonZeroU16};
 
 use crab_nat::PortMappingOptions;
 
+/// A simple command line utility to manage NAT-PMP and PCP port mappings.
 #[derive(clap::Parser)]
 struct Cli {
-    /// Delete the port mapping instead of creating one.
+    /// Delete the port mapping on exit.
     #[arg(short, long)]
     delete: bool,
+
+    /// Delete all port mappings for the protocol through NAT-PMP. No mappings are created.
+    #[arg(long)]
+    delete_all: bool,
 
     /// The gateway address to use. If empty, will attempt to determine a default gateway.
     #[arg(short, long)]
@@ -17,8 +22,8 @@ struct Cli {
     local_address: Option<String>,
 
     /// The internal port to map into.
-    #[arg(short = 'p', long, default_value_t = 8080)]
-    internal_port: u16,
+    #[arg(short = 'p', long, default_value_t = NonZeroU16::new(8080).unwrap())]
+    internal_port: NonZeroU16,
 
     /// The external port to try to map. Server is not guaranteed to use this port.
     #[arg(short = 'e', long)]
@@ -29,7 +34,7 @@ struct Cli {
     external_ip: bool,
 
     /// The protocol to map. Either "tcp" or "udp".
-    #[arg(short, long, default_value = "tcp")]
+    #[arg(short, long, default_value = "udp")]
     internet_protocol: String,
 }
 
@@ -101,6 +106,15 @@ async fn main() {
     );
     tracing::info!("Using gateway address: {gateway:#}");
 
+    // If the delete all flag is set, attempt to delete all mappings for the protocol and exit.
+    if args.delete_all {
+        crab_nat::natpmp::try_drop_mapping(gateway, protocol, None, None).await.unwrap_or_else(|e| {
+            tracing::error!("Failed to delete mappings: {e:#}");
+        });
+        tracing::info!("Successfully deleted all mappings for protocol {protocol:?}");
+        return;
+    }
+
     // If the external IP flag is set, attempt to get the external IP and exit.
     if args.external_ip {
         let external_ip = match crab_nat::natpmp::external_address(gateway, None).await {
@@ -110,48 +124,32 @@ async fn main() {
         return tracing::info!("External IP: {external_ip:#}");
     }
 
+    // Attempt a port mapping request.
+    let mapping = match crab_nat::PortMapping::new(
+        gateway,
+        local_address,
+        protocol,
+        args.internal_port,
+        PortMappingOptions {
+            external_port: args.external_port,
+            ..Default::default()
+        },
+    )
+    .await
+    {
+        Ok(m) => m,
+        Err(e) => return tracing::error!("Failed to map port: {e:#}"),
+    };
+    let protocol = mapping.protocol();
+    let external_port = mapping.external_port();
+    let internal_port = mapping.internal_port();
+    let lifetime = mapping.lifetime();
+    let mapping_type = mapping.mapping_type();
+
+    // Print the mapped port information.
+    tracing::info!("Successfully mapped protocol {protocol:?} on external port {external_port} to internal port {internal_port} with a lifetime of {lifetime:?} seconds using {mapping_type:?}");
+
     if args.delete {
-        // Attempt a port unmapping request.
-        if let Err(e) = crab_nat::natpmp::try_drop_mapping(
-            gateway,
-            protocol,
-            NonZeroU16::new(args.internal_port),
-            None,
-        )
-        .await
-        {
-            return tracing::error!("Failed to unmap port: {e:#}");
-        }
-
-        // Print the mapped port information.
-        tracing::info!("Success! Deleted previous port mapping");
-    } else {
-        // Attempt a port mapping request.
-        let mapping = match crab_nat::PortMapping::new(
-            gateway,
-            local_address,
-            protocol,
-            NonZeroU16::new(args.internal_port)
-                .expect("Internal port cannot be zero when creating a mapping"),
-            PortMappingOptions {
-                external_port: args.external_port,
-                ..Default::default()
-            },
-        )
-        .await
-        {
-            Ok(m) => m,
-            Err(e) => return tracing::error!("Failed to map port: {e:#}"),
-        };
-        let protocol = mapping.protocol();
-        let external_port = mapping.external_port();
-        let internal_port = mapping.internal_port();
-        let lifetime = mapping.lifetime();
-        let mapping_type = mapping.mapping_type();
-
-        // Print the mapped port information.
-        tracing::info!("Successfully mapped protocol {protocol:?} on external port {external_port} to internal port {internal_port} with a lifetime of {lifetime:?} seconds using {mapping_type:?}");
-
         // Try to safely drop the mapping.
         if let Err((e, m)) = mapping.try_drop().await {
             tracing::error!(

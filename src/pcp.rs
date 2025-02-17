@@ -37,7 +37,9 @@ pub type Nonce = [u32; 3];
 
 /// Valid result codes from a PCP response.
 /// See <https://www.rfc-editor.org/rfc/rfc6887#section-7.4>.
-#[derive(Debug, displaydoc::Display, thiserror::Error, PartialEq, num_enum::TryFromPrimitive)]
+#[derive(
+    Clone, Copy, Debug, displaydoc::Display, thiserror::Error, PartialEq, num_enum::TryFromPrimitive,
+)]
 #[repr(u8)]
 pub enum ResultCode {
     /// Success. Will not be returned as an error.
@@ -84,7 +86,7 @@ pub enum ResultCode {
 }
 
 /// Operation codes for NAT-PMP, see <https://www.rfc-editor.org/rfc/rfc6887#section-19.1>.
-#[derive(Debug, num_enum::TryFromPrimitive, PartialEq)]
+#[derive(Clone, Copy, Debug, num_enum::TryFromPrimitive, PartialEq)]
 #[repr(u8)]
 pub enum OperationCode {
     /// Create a port mapping on the gateway.
@@ -345,6 +347,7 @@ pub async fn port_mapping_all_ports(
 
 /// The range of port mappings to drop.
 /// Either a `Single` port for a given protocol or `All` ports for a single protocols, or all protocols if `None`.
+#[derive(Clone, Copy, Debug)]
 pub enum DropMappingRange {
     Single {
         protocol: InternetProtocol,
@@ -711,6 +714,7 @@ async fn port_mapping_internal(
 struct PcpResponse {
     /// The number of bytes in the response.
     pub n: usize,
+
     /// Bytestream containing the response. Only the first `n` bytes are valid.
     pub bb: BytesMut,
 }
@@ -816,7 +820,8 @@ struct ResponseHeader {
     pub gateway_epoch_seconds: u32,
 }
 
-/// Helper to write the common PCP request header. Returns the suggested external IP address, or the zero address, in fixed-length format.
+/// Helper to write the common PCP request header.
+/// Returns the suggested external IP if some, else the zero address, in fixed-length format.
 fn write_base_request(
     op: OperationCode,
     client: IpAddr,
@@ -1121,13 +1126,8 @@ impl PortMappingAllPorts {
 
     /// Attempts to safely delete this port mapping on the gateway, otherwise returns an error and the `PortMapping` back.
     /// # Errors
-    /// Returns a `pcp::Failure` enum which decomposes into different errors depending on the cause:
-    /// * `Socket` if there is an error using the UDP socket.
-    /// * `Timeout` if the gateway is not responding.
-    /// * `Nonce` if the gateway gave a nonce we weren't expecting.
-    /// * `InvalidResponse` if the gateway gave an invalid response.
-    /// * `UnsupportedVersion` if the gateway does not support the PCP protocol.
-    /// * `ResultCode` if the gateway gave a valid response, but it was an error. Will never return `ResultCode::Success` as an error.
+    /// Returns a pair containing a `pcp::Failure` enum, which decomposes into different errors
+    /// depending on the cause, and the unmodified mapping.
     pub async fn try_drop(self) -> Result<(), (Failure, Self)> {
         // Attempt to drop the existing port mapping on the gateway.
         try_drop_mapping(

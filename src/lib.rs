@@ -170,7 +170,7 @@ impl PortMapping {
         protocol: InternetProtocol,
         internal_port: NonZeroU16,
         mapping_options: PortMappingOptions,
-    ) -> Result<PortMapping, MappingFailure> {
+    ) -> Result<Self, MappingFailure> {
         // Try to use PCP first, as recommended by the RFC in the last paragraph of section 1.1 <https://www.rfc-editor.org/rfc/rfc6886#page-5>.
         match pcp::port_mapping(
             pcp::BaseMapRequest::new(gateway, client, protocol, internal_port),
@@ -368,7 +368,7 @@ mod helpers {
     where
         F: Fn(Duration) -> Duration,
     {
-        // Create an internal helper to easily try sending and receiving packets, and springboard errors back to the caller.
+        // Internal helper to try sending and receiving packets; will springboard errors back to the caller.
         async fn send_and_recv(
             socket: &UdpSocket,
             send_bytes: &[u8],

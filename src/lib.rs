@@ -43,7 +43,7 @@ pub mod pcp;
 
 // The RFC for NAT-PMP states that connections SHOULD make up to 9 attempts, <https://www.rfc-editor.org/rfc/rfc6886#section-3.1> page 6.
 // The RFC for PCP states that connections SHOULD make attempts without a limit, <https://www.rfc-editor.org/rfc/rfc6887#section-8.1.1> page 22.
-// However, that would be largely impractical so we set a sane default of 3 retries after an initial timeout fails.
+// However, that would be largely impractical so we set a sane default of 3 retries after the first attempt fails.
 const SANE_MAX_REQUEST_RETRIES: usize = 3;
 
 /// The required port for NAT-PMP and its successor, PCP.
@@ -53,16 +53,24 @@ pub const GATEWAY_PORT: u16 = 5351;
 pub const RECOMMENDED_MAPPING_LIFETIME_SECONDS: u32 = 7200;
 
 /// 8-bit version field in the NAT-PMP and PCP headers.
-#[derive(Debug, PartialEq, TryFromPrimitive)]
+#[derive(Clone, Copy, Debug, PartialEq, TryFromPrimitive)]
 #[repr(u8)]
 pub enum VersionCode {
     /// NAT-PMP identifies its version with a `0` byte.
-    NatPmp = 0,
+    NatPmp,
 
     /// PCP identifies its version with a `2` byte.
     /// The RFC explicitly states that PCP must use version `2` because non-compliant
     /// devices were created that used `1` before the creation of PCP.
     Pcp = 2,
+}
+impl std::fmt::Display for VersionCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            VersionCode::NatPmp => write!(f, "NAT-PMP"),
+            VersionCode::Pcp => write!(f, "PCP"),
+        }
+    }
 }
 
 /// Specifies the protocol to map a port for.
@@ -78,8 +86,14 @@ pub enum InternetProtocol {
 pub enum PortMappingType {
     NatPmp,
     Pcp {
+        /// Our address as seen by the PCP server.
         client: IpAddr,
+
+        /// The nonce used to identify this session with the PCP server.
+        /// A unique nonce may be used for each mapping, see <https://www.rfc-editor.org/rfc/rfc6887#page-44>.
         nonce: pcp::Nonce,
+
+        /// The external IP address of the client.
         external_ip: IpAddr,
     },
 }
@@ -99,7 +113,7 @@ pub struct TimeoutConfig {
 }
 
 /// Optional configuration values for a port mapping request.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct PortMappingOptions {
     /// The external port to try to map. The server is not guaranteed to use this port.
     pub external_port: Option<NonZeroU16>,
@@ -111,7 +125,7 @@ pub struct PortMappingOptions {
     pub timeout_config: Option<TimeoutConfig>,
 }
 
-/// A port mapping on the gateway. Should be renewed with `.try_renew()` and deleted from the gateway with `.try_drop()`.
+/// A port mapping on the gateway. Should be renewed with `.renew()` and deleted from the gateway with `.try_drop()`.
 #[derive(Clone, Debug)]
 pub struct PortMapping {
     /// The address of the gateway the mapping is registered with.
@@ -147,9 +161,9 @@ impl PortMapping {
     /// If no lifetime is specified, the NAT-PMP recommended lifetime of two hours will be used.
     /// # Errors
     /// Returns a `MappingFailure` enum which decomposes into a `NatPmp(natpmp::Failure)` or a `Pcp(pcp::Failure)` depending on which failed.
-    /// Will never return `Pcp(pcp::Failure::UnsupportedVersion(0))` because NAT-PMP will be used as a fallback in this case.
-    /// If a different `Pcp(_)` error is returned, then NAT-PMP is likely not supported by the gateway and this call will not attempt it.
-    /// If you want to still attempt NAT-PMP after PCP fails for unknown reasons, you can call `natpmp::try_port_mapping(..)` directly.
+    /// Will never return `Pcp(pcp::Failure::UnsupportedVersion(VersionCode::NatPmp))` because NAT-PMP will be used as a fallback in this case.
+    /// If a different `Pcp(_)` error is returned, then *NAT-PMP is likely not supported* by the gateway and this call will not attempt it.
+    /// If you want to still attempt NAT-PMP after PCP fails, you can call `natpmp::port_mapping(..)` directly.
     pub async fn new(
         gateway: IpAddr,
         client: IpAddr,
@@ -158,7 +172,7 @@ impl PortMapping {
         mapping_options: PortMappingOptions,
     ) -> Result<PortMapping, MappingFailure> {
         // Try to use PCP first, as recommended by the RFC in the last paragraph of section 1.1 <https://www.rfc-editor.org/rfc/rfc6886#page-5>.
-        match pcp::try_port_mapping(
+        match pcp::port_mapping(
             pcp::BaseMapRequest::new(gateway, client, protocol, internal_port),
             None,
             None,
@@ -169,15 +183,15 @@ impl PortMapping {
             // If we succeed, return the mapping.
             Ok(m) => return Ok(m),
 
-            // If the gateway does not support PCP, but is recommending version `0` (NAT-PMP) then fall back silently.
-            Err(pcp::Failure::UnsupportedVersion(v)) if v == VersionCode::NatPmp as u8 => {}
+            // If the gateway does not support PCP, but is recommending NAT-PMP, then fall back silently.
+            Err(pcp::Failure::UnsupportedVersion(VersionCode::NatPmp)) => {}
 
             // Otherwise, return the error.
             Err(e) => return Err(e.into()),
         }
 
         // Fall back to the older, possibly more widely supported, NAT-PMP.
-        natpmp::try_port_mapping(gateway, protocol, internal_port, mapping_options)
+        natpmp::port_mapping(gateway, protocol, internal_port, mapping_options)
             .await
             .map_err(std::convert::Into::into)
     }
@@ -186,7 +200,7 @@ impl PortMapping {
     /// # Errors
     /// Returns a `MappingFailure` enum which decomposes into a `NatPmp(natpmp::Failure)` or a `Pcp(pcp::Failure)`
     /// depending on which protocol was used to create the mapping.
-    pub async fn try_renew(&mut self) -> Result<(), MappingFailure> {
+    pub async fn renew(&mut self) -> Result<(), MappingFailure> {
         // The optional configuration values for the port mapping request.
         let options = PortMappingOptions {
             external_port: Some(self.external_port),
@@ -197,21 +211,17 @@ impl PortMapping {
         // Attempt to renew the existing port mapping on the gateway.
         match self.mapping_type {
             PortMappingType::NatPmp => {
-                *self = natpmp::try_port_mapping(
-                    self.gateway,
-                    self.protocol,
-                    self.internal_port,
-                    options,
-                )
-                .await
-                .map_err(MappingFailure::from)?;
+                *self =
+                    natpmp::port_mapping(self.gateway, self.protocol, self.internal_port, options)
+                        .await
+                        .map_err(MappingFailure::from)?;
             }
             PortMappingType::Pcp {
                 client,
                 nonce,
                 external_ip,
             } => {
-                *self = pcp::try_port_mapping(
+                *self = pcp::port_mapping(
                     pcp::BaseMapRequest::new(
                         self.gateway,
                         client,
@@ -337,7 +347,12 @@ mod helpers {
     }
 
     /// Send a request and wait for a response, retrying on timeout up to `max_retries` times.
-    /// Allow for a custom fuzzing function to be applied to the timeout after each retry. This is to avoid synchronization issues, but `std::convert::identity` can be used as a no-op.
+    /// Allow for a custom fuzzing function to be applied to the timeout after each retry. This is to
+    /// avoid synchronization issues, but `std::convert::identity` can be used as a no-op.
+    /// `fuzz_timeout` is given the timeout to be used for the next request, and can be modified in
+    /// place if necessary.
+    /// # Returns
+    /// On success, will return the number of bytes read from the response into `recv_buf`.
     /// # Errors
     /// Will return a `Socket(..)` error if we:
     /// * Failed to send data on the socket
@@ -371,7 +386,7 @@ mod helpers {
                 .map_err(RequestSendError::Socket)
         }
 
-        // Use the RFC recommended initial timeout and double it on each successive failure.
+        // Use the specified initial timeout and double it on each successive failure.
         let mut wait = timeout_config.initial_timeout;
         let mut retries = 0;
         let max_retries = timeout_config.max_retries;
@@ -418,6 +433,7 @@ mod helpers {
 pub enum MappingFailure {
     #[error("NAT-PMP({0})")]
     NatPmp(natpmp::Failure),
+
     #[error("PCP({0})")]
     Pcp(pcp::Failure),
 }

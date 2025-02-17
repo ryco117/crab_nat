@@ -36,7 +36,7 @@ pub const TIMEOUT_CONFIG_DEFAULT: TimeoutConfig = TimeoutConfig {
 pub type Nonce = [u32; 3];
 
 /// Valid result codes from a PCP response.
-/// See <https://www.rfc-editor.org/rfc/rfc6887#section-7.4>
+/// See <https://www.rfc-editor.org/rfc/rfc6887#section-7.4>.
 #[derive(Debug, displaydoc::Display, thiserror::Error, PartialEq, num_enum::TryFromPrimitive)]
 #[repr(u8)]
 pub enum ResultCode {
@@ -83,7 +83,7 @@ pub enum ResultCode {
     ExcessiveRemotePeers,
 }
 
-/// Operation codes for NAT-PMP.
+/// Operation codes for NAT-PMP, see <https://www.rfc-editor.org/rfc/rfc6887#section-19.1>.
 #[derive(Debug, num_enum::TryFromPrimitive, PartialEq)]
 #[repr(u8)]
 pub enum OperationCode {
@@ -114,13 +114,61 @@ pub enum Failure {
     InvalidResponse(String),
 
     /// The gateway gave a version-mismatch response with a closest supported version.
-    #[error("Unsupported version request. Closest supported version: {0}")]
-    UnsupportedVersion(u8),
+    #[error("Server responded with code: Unsupported version: Closest supported version: {0}")]
+    UnsupportedVersion(VersionCode),
 
-    /// The gateway gave a valid response, but it was an error.
-    /// The `ResultCode` is guaranteed to neither be `ResultCode::Success` nor `ResultCode::UnsupportedVersion`.
-    #[error("Gateway error: {0}")]
-    ResultCode(ResultCode),
+    /// The server has not authorized our client to make the requested operation.
+    /// An estimation of how long the error will persist is given in seconds.
+    #[error("Server responded with code: Not authorized")]
+    NotAuthorized(u32),
+
+    /// The request was formatted incorrectly.
+    #[error("Server responded with code: Malformed request")]
+    MalformedRequest,
+
+    /// The server does not support the requested operation.
+    #[error("Server responded with code: Unsupported opcode")]
+    UnsupportedOpcode,
+
+    /// The server does not support a required option.
+    #[error("Server responded with code: Unsupported option")]
+    UnsupportedOption,
+
+    /// An option was formatted incorrectly.
+    #[error("Server responded with code: Malformed option")]
+    MalformedOption,
+
+    /// The server is experiencing a temporary network failure.
+    /// An estimation of how long the error will persist is given in seconds.
+    #[error("Server responded with code: Network failure")]
+    NetworkFailure(u32),
+
+    /// The server is lacking resources to complete the request.
+    /// An estimation of how long the error will persist is given in seconds.
+    #[error("Server responded with code: No resources")]
+    NoResources(u32),
+
+    /// The server does not support the requested protocol.
+    #[error("Server responded with code: Unsupported protocol")]
+    UnsupportedProtocol,
+
+    /// Our port mapping quota with the server has been reached.
+    /// An estimation of how long the error will persist is given in seconds.
+    #[error("Server responded with code: User exceeded quota")]
+    UserExceededQuota(u32),
+
+    /// The server cannot provide the requested external address.
+    /// An estimation of how long the error will persist is given in seconds.
+    #[error("Server responded with code: Cannot provide external")]
+    CannotProvideExternal(u32),
+
+    /// The given client address differs from what the server sees.
+    #[error("Server responded with code: Address mismatch")]
+    AddressMismatch,
+
+    /// The server is not able to create the requested filters.
+    #[error("Server responded with code: Excessive remote peers")]
+    ExcessiveRemotePeers,
 }
 impl From<RequestSendError> for Failure {
     fn from(e: RequestSendError) -> Self {
@@ -160,14 +208,8 @@ impl BaseMapRequest {
 /// Attempts to map a port on the gateway using PCP.
 /// Will try to use the given external port if it is `Some`, otherwise it will let the gateway choose.
 /// # Errors
-/// Returns a `pcp::Failure` enum which decomposes into different errors depending on the cause:
-/// * `Socket` if there is an error using the UDP socket.
-/// * `Timeout` if the gateway is not responding.
-/// * `Nonce` if the gateway gave a nonce we weren't expecting.
-/// * `InvalidResponse` if the gateway gave an invalid response.
-/// * `UnsupportedVersion` if the gateway does not support the PCP protocol.
-/// * `ResultCode` if the gateway gave a valid response, but it was an error. Will never return `ResultCode::Success` as an error.
-pub async fn try_port_mapping(
+/// Returns a `pcp::Failure` enum which decomposes into different errors depending on the cause.
+pub async fn port_mapping(
     base: BaseMapRequest,
     session_nonce: Option<Nonce>,
     suggested_external_ip: Option<IpAddr>,
@@ -190,7 +232,7 @@ pub async fn try_port_mapping(
         external_ip,
         timeout_config,
         ..
-    } = try_port_mapping_internal(
+    } = port_mapping_internal(
         base.gateway,
         base.client,
         session_nonce,
@@ -256,14 +298,8 @@ pub struct PortMappingAllPorts {
 /// If the protocol is `None`, it will try to map all ports for all protocols.
 /// Otherwise, only the specified protocol will be mapped.
 /// # Errors
-/// Returns a `pcp::Failure` enum which decomposes into different errors depending on the cause:
-/// * `Socket` if there is an error using the UDP socket.
-/// * `Timeout` if the gateway is not responding.
-/// * `Nonce` if the gateway gave a nonce we weren't expecting.
-/// * `InvalidResponse` if the gateway gave an invalid response.
-/// * `UnsupportedVersion` if the gateway does not support the PCP protocol.
-/// * `ResultCode` if the gateway gave a valid response, but it was an error. Will never return `ResultCode::Success` as an error.
-pub async fn try_port_mapping_all_ports(
+/// Returns a `pcp::Failure` enum which decomposes into different errors depending on the cause.
+pub async fn port_mapping_all_ports(
     gateway: IpAddr,
     client: IpAddr,
     protocol: Option<InternetProtocol>,
@@ -284,7 +320,7 @@ pub async fn try_port_mapping_all_ports(
         external_ip,
         timeout_config,
         ..
-    } = try_port_mapping_internal(
+    } = port_mapping_internal(
         gateway,
         client,
         session_nonce,
@@ -324,13 +360,7 @@ pub enum DropMappingRange {
 /// This may not reduce the remaining lifetime of the mapping on the PCP server for security reasons.
 /// See <https://www.rfc-editor.org/rfc/rfc6887#section-15> for more details.
 /// # Errors
-/// Returns a `pcp::Failure` enum which decomposes into different errors depending on the cause:
-/// * `Socket` if there is an error using the UDP socket.
-/// * `Timeout` if the gateway is not responding.
-/// * `Nonce` if the gateway gave a nonce we weren't expecting.
-/// * `InvalidResponse` if the gateway gave an invalid response.
-/// * `UnsupportedVersion` if the gateway does not support the PCP protocol.
-/// * `ResultCode` if the gateway gave a valid response, but it was an error. Will never return `ResultCode::Success` as an error.
+/// Returns a `pcp::Failure` enum which decomposes into different errors depending on the cause.
 pub async fn try_drop_mapping(
     gateway: IpAddr,
     client: IpAddr,
@@ -359,7 +389,7 @@ pub async fn try_drop_mapping(
     // The difference is that the lifetime and external port must be set to `0`.
     let PortMappingInternal {
         lifetime_seconds, ..
-    } = try_port_mapping_internal(
+    } = port_mapping_internal(
         gateway,
         client,
         Some(nonce),
@@ -421,14 +451,8 @@ pub struct PeerMapping {
 
 /// Attempts to open a mapping to a remote peer's socket address.
 /// # Errors
-/// Returns a `pcp::Failure` enum which decomposes into different errors depending on the cause:
-/// * `Socket` if there is an error using the UDP socket.
-/// * `Timeout` if the gateway is not responding.
-/// * `Nonce` if the gateway gave a nonce we weren't expecting.
-/// * `InvalidResponse` if the gateway gave an invalid response.
-/// * `UnsupportedVersion` if the gateway does not support the PCP protocol.
-/// * `ResultCode` if the gateway gave a valid response, but it was an error. Will never return `ResultCode::Success` as an error.
-pub async fn try_peer_mapping(
+/// Returns a `pcp::Failure` enum which decomposes into different errors depending on the cause.
+pub async fn peer_mapping(
     base: BaseMapRequest,
     session_nonce: Option<Nonce>,
     suggested_external_ip: Option<IpAddr>,
@@ -577,7 +601,12 @@ struct PortMappingInternal {
 }
 
 /// Helper for attempting a port mapping with more permissive input.
-async fn try_port_mapping_internal(
+/// # Errors
+/// Returns a `pcp::Failure` enum which decomposes into different errors depending on the cause.
+/// # Panics
+/// Panics if the `lifetime_seconds` is `Some(0)` and the `map_range` has a suggested external IP
+/// or a suggested external port.
+async fn port_mapping_internal(
     gateway: IpAddr,
     client: IpAddr,
     nonce: Option<Nonce>,
@@ -588,20 +617,24 @@ async fn try_port_mapping_internal(
     // Ensure that a lifetime of `0` is only used for valid delete requests.
     // See section 15.1, <https://www.rfc-editor.org/rfc/rfc6887#section-15.1>.
     #[cfg(debug_assertions)]
-    if lifetime_seconds.is_some_and(|l| l == 0)
-        && if let MappingRange::Single {
-            suggested_external_ip,
-            suggested_external_port,
-            ..
-        } = map_range
-        {
-            suggested_external_ip.is_some() || suggested_external_port.is_some()
-        } else {
-            false
-        }
-    {
-        return Err(Failure::ResultCode(ResultCode::MalformedRequest));
-    }
+    assert!(
+        lifetime_seconds.is_none_or(|l| l > 0)
+            || match &map_range {
+                MappingRange::Single {
+                    suggested_external_ip,
+                    suggested_external_port,
+                    ..
+                } => {
+                    suggested_external_ip.is_none_or(|ip| ip.is_unspecified())
+                        && suggested_external_port.is_none()
+                }
+                MappingRange::All {
+                    suggested_external_ip,
+                    ..
+                } => suggested_external_ip.is_none_or(|ip| ip.is_unspecified()),
+            },
+        "Lifetime of 0 is only valid for deletion requests"
+    );
 
     let timeout_config = timeout_config.unwrap_or(TIMEOUT_CONFIG_DEFAULT);
 
@@ -822,20 +855,13 @@ fn validate_base_response(bb: &mut bytes::BytesMut) -> Result<ResponseHeader, Fa
     if n < 24 {
         let header_bytes = &bb[..n];
 
+        // Both NAT-PMP and PCP responses have compatible 4-byte headers.
         if n >= 4 {
-            let version = header_bytes[0];
+            let version = header_bytes[0].try_into().map_err(|_| {
+                Failure::InvalidResponse(format!("Unknown version: {:X?}", header_bytes[0]))
+            })?;
 
-            // Check if the response header matches a `natpmp::ResultCode::UnsupportedVersion` since older devices may not support PCP.
-            if version == 0
-                && crate::natpmp::ResultCode::try_from(
-                    (u16::from(header_bytes[2]) << 8) + u16::from(header_bytes[3]),
-                )
-                .is_ok_and(|r| r == crate::natpmp::ResultCode::UnsupportedVersion)
-            {
-                return Err(Failure::UnsupportedVersion(0));
-            }
-
-            // Check if it matches the more general PCP version (where the third byte is reserved).
+            // Check if it matches a PCP unsupported version code.
             if ResultCode::try_from(header_bytes[3])
                 .is_ok_and(|r| r == ResultCode::UnsupportedVersion)
             {
@@ -843,6 +869,7 @@ fn validate_base_response(bb: &mut bytes::BytesMut) -> Result<ResponseHeader, Fa
             }
         }
 
+        // The response is too short to be valid.
         return Err(Failure::InvalidResponse(format!(
             "Too few bytes received: {header_bytes:X?}"
         )));
@@ -857,7 +884,7 @@ fn validate_base_response(bb: &mut bytes::BytesMut) -> Result<ResponseHeader, Fa
 
     // Parse the PCP response header.
     let v = VersionCode::try_from(bb.get_u8())
-        .map_err(|v| Failure::InvalidResponse(format!("Invalid version: {v:#}")))?;
+        .map_err(|v| Failure::InvalidResponse(format!("Unknown version: {v:#}")))?;
     if v != VersionCode::Pcp {
         return Err(Failure::InvalidResponse(format!(
             "Unsupported version: {v:?}"
@@ -875,15 +902,29 @@ fn validate_base_response(bb: &mut bytes::BytesMut) -> Result<ResponseHeader, Fa
         .map_err(|r| Failure::InvalidResponse(format!("Invalid result code: {r:#}")))?;
 
     // On error, lifetime indicates the number of seconds until the error is expected to be resolved.
+    // See <https://www.rfc-editor.org/rfc/rfc6887#section-8.3>, page 26.
     let lifetime_seconds = bb.get_u32();
     let gateway_epoch_seconds = bb.get_u32();
 
     bb.advance(12); // Reserved.
 
-    if result_code != ResultCode::Success {
-        // The server gave us a correct response, but it was an error.
-        return Err(Failure::ResultCode(result_code));
-    }
+    // Map error result codes to a failure, otherwise continue.
+    match result_code {
+        ResultCode::Success => Ok(()),
+        ResultCode::UnsupportedVersion => Err(Failure::UnsupportedVersion(v)),
+        ResultCode::NotAuthorized => Err(Failure::NotAuthorized(lifetime_seconds)),
+        ResultCode::MalformedRequest => Err(Failure::MalformedRequest),
+        ResultCode::UnsupportedOpcode => Err(Failure::UnsupportedOpcode),
+        ResultCode::UnsupportedOption => Err(Failure::UnsupportedOption),
+        ResultCode::MalformedOption => Err(Failure::MalformedOption),
+        ResultCode::NetworkFailure => Err(Failure::NetworkFailure(lifetime_seconds)),
+        ResultCode::NoResources => Err(Failure::NoResources(lifetime_seconds)),
+        ResultCode::UnsupportedProtocol => Err(Failure::UnsupportedProtocol),
+        ResultCode::UserExceededQuota => Err(Failure::UserExceededQuota(lifetime_seconds)),
+        ResultCode::CannotProvideExternal => Err(Failure::CannotProvideExternal(lifetime_seconds)),
+        ResultCode::AddressMismatch => Err(Failure::AddressMismatch),
+        ResultCode::ExcessiveRemotePeers => Err(Failure::ExcessiveRemotePeers),
+    }?;
 
     Ok(ResponseHeader {
         lifetime_seconds,
@@ -973,16 +1014,10 @@ fn validate_protocol(
 impl PeerMapping {
     /// Attempts to renew this peer mapping on the gateway, otherwise returns an error.
     /// # Errors
-    /// Returns a `pcp::Failure` enum which decomposes into different errors depending on the cause:
-    /// * `Socket` if there is an error using the UDP socket.
-    /// * `Timeout` if the gateway is not responding.
-    /// * `Nonce` if the gateway gave a nonce we weren't expecting.
-    /// * `InvalidResponse` if the gateway gave an invalid response.
-    /// * `UnsupportedVersion` if the gateway does not support the PCP protocol.
-    /// * `ResultCode` if the gateway gave a valid response, but it was an error. Will never return `ResultCode::Success` as an error.
-    pub async fn try_renew(&mut self) -> Result<(), Failure> {
+    /// Returns a `pcp::Failure` enum which decomposes into different errors depending on the cause.
+    pub async fn renew(&mut self) -> Result<(), Failure> {
         // Attempt to renew the existing port mapping on the gateway.
-        *self = try_peer_mapping(
+        *self = peer_mapping(
             BaseMapRequest::new(self.gateway, self.client, self.protocol, self.internal_port),
             Some(self.nonce),
             Some(self.external_ip),
@@ -999,16 +1034,11 @@ impl PeerMapping {
 
     /// Attempts to safely delete this peer mapping on the gateway, otherwise returns an error and the `PeerMapping` back.
     /// # Errors
-    /// Returns a `pcp::Failure` enum which decomposes into different errors depending on the cause:
-    /// * `Socket` if there is an error using the UDP socket.
-    /// * `Timeout` if the gateway is not responding.
-    /// * `Nonce` if the gateway gave a nonce we weren't expecting.
-    /// * `InvalidResponse` if the gateway gave an invalid response.
-    /// * `UnsupportedVersion` if the gateway does not support the PCP protocol.
-    /// * `ResultCode` if the gateway gave a valid response, but it was an error. Will never return `ResultCode::Success` as an error.
+    /// Returns a pair containing a `pcp::Failure` enum, which decomposes into different errors
+    /// depending on the cause, and the unmodified mapping.
     pub async fn try_drop(self) -> Result<(), (Failure, Self)> {
         // Attempt to drop the existing port mapping on the gateway.
-        try_peer_mapping(
+        peer_mapping(
             BaseMapRequest::new(self.gateway, self.client, self.protocol, self.internal_port),
             Some(self.nonce),
             None,
@@ -1073,16 +1103,10 @@ impl PeerMapping {
 impl PortMappingAllPorts {
     /// Attempts to renew this port mapping on the gateway, otherwise returns an error.
     /// # Errors
-    /// Returns a `pcp::Failure` enum which decomposes into different errors depending on the cause:
-    /// * `Socket` if there is an error using the UDP socket.
-    /// * `Timeout` if the gateway is not responding.
-    /// * `Nonce` if the gateway gave a nonce we weren't expecting.
-    /// * `InvalidResponse` if the gateway gave an invalid response.
-    /// * `UnsupportedVersion` if the gateway does not support the PCP protocol.
-    /// * `ResultCode` if the gateway gave a valid response, but it was an error. Will never return `ResultCode::Success` as an error.
-    pub async fn try_renew(&mut self) -> Result<(), Failure> {
+    /// Returns a `pcp::Failure` enum which decomposes into different errors depending on the cause.
+    pub async fn renew(&mut self) -> Result<(), Failure> {
         // Attempt to renew the existing port mapping on the gateway.
-        *self = try_port_mapping_all_ports(
+        *self = port_mapping_all_ports(
             self.gateway,
             self.client,
             self.protocol,

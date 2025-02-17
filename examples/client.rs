@@ -48,54 +48,62 @@ async fn main() {
         _ => panic!("Invalid protocol"),
     };
 
-    let local_address = if let Some(address) = args.local_address {
-        address.parse().expect("Invalid local address format")
-    } else {
-        netdev::interface::get_local_ipaddr().expect("Could not determine a local address")
-    };
+    let local_address = args.local_address.filter(|a| !a.is_empty()).map_or_else(
+        || netdev::interface::get_local_ipaddr().expect("Could not determine a local address"),
+        |address| {
+            address
+                .parse()
+                .expect("Invalid local address, must be an IP address")
+        },
+    );
     tracing::info!("Using local address: {local_address:#}");
 
     // Get the gateway address from the command line or guess the default.
-    let gateway = if let Some(gateway) = args.gateway {
-        gateway.parse().expect("Invalid gateway format")
-    } else {
-        // Attempt to get a sensible default gateway.
-        let gateway = netdev::get_default_gateway().expect("Could not determine a gateway");
+    let gateway = args.gateway.filter(|g| !g.is_empty()).map_or_else(
+        || {
+            // Attempt to get a sensible default gateway.
+            let gateway = netdev::get_default_gateway().expect("Could not determine a gateway");
 
-        // Attempt to get a gateway address matching the IP version of the local address.
-        if local_address.is_ipv4() {
+            // Attempt to get a gateway address matching the IP version of the local address.
+            if local_address.is_ipv4() {
+                gateway
+                    .ipv4
+                    .first()
+                    .map(|ip| IpAddr::V4(*ip))
+                    .unwrap_or_else(|| {
+                        IpAddr::V6(
+                            *gateway
+                                .ipv6
+                                .first()
+                                .expect("No addresses found for default gateway"),
+                        )
+                    })
+            } else {
+                gateway
+                    .ipv6
+                    .first()
+                    .map(|ip| IpAddr::V6(*ip))
+                    .unwrap_or_else(|| {
+                        IpAddr::V4(
+                            *gateway
+                                .ipv4
+                                .first()
+                                .expect("No addresses found for default gateway"),
+                        )
+                    })
+            }
+        },
+        |gateway| {
             gateway
-                .ipv4
-                .first()
-                .map(|ip| IpAddr::V4(*ip))
-                .unwrap_or_else(|| {
-                    IpAddr::V6(
-                        *gateway
-                            .ipv6
-                            .first()
-                            .expect("No addresses found for default gateway"),
-                    )
-                })
-        } else {
-            gateway
-                .ipv6
-                .first()
-                .map(|ip| IpAddr::V6(*ip))
-                .unwrap_or_else(|| {
-                    IpAddr::V4(
-                        *gateway
-                            .ipv4
-                            .first()
-                            .expect("No addresses found for default gateway"),
-                    )
-                })
-        }
-    };
+                .parse()
+                .expect("Invalid gateway, must be an IP address")
+        },
+    );
     tracing::info!("Using gateway address: {gateway:#}");
 
     // If the external IP flag is set, attempt to get the external IP and exit.
     if args.external_ip {
-        let external_ip = match crab_nat::natpmp::try_external_address(gateway, None).await {
+        let external_ip = match crab_nat::natpmp::external_address(gateway, None).await {
             Ok(ip) => ip,
             Err(e) => return tracing::error!("Failed to get external IP: {e:#}"),
         };
@@ -123,7 +131,8 @@ async fn main() {
             gateway,
             local_address,
             protocol,
-            NonZeroU16::new(args.internal_port).expect("Invalid internal port"),
+            NonZeroU16::new(args.internal_port)
+                .expect("Internal port cannot be zero when creating a mapping"),
             PortMappingOptions {
                 external_port: args.external_port,
                 ..Default::default()
@@ -141,7 +150,7 @@ async fn main() {
         let mapping_type = mapping.mapping_type();
 
         // Print the mapped port information.
-        tracing::info!("Successfully mapped protocol {protocol:?} on external port {external_port} to internal port {internal_port} with a lifetime of {lifetime:?} using {mapping_type:?}");
+        tracing::info!("Successfully mapped protocol {protocol:?} on external port {external_port} to internal port {internal_port} with a lifetime of {lifetime:?} seconds using {mapping_type:?}");
 
         // Try to safely drop the mapping.
         if let Err((e, m)) = mapping.try_drop().await {

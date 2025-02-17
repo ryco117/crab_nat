@@ -28,10 +28,12 @@ pub const TIMEOUT_CONFIG_DEFAULT: TimeoutConfig = TimeoutConfig {
 
 /// Result codes from a NAT-PMP response.
 /// See <https://www.rfc-editor.org/rfc/rfc6886#section-3.5>
-#[derive(Debug, displaydoc::Display, PartialEq, thiserror::Error, TryFromPrimitive)]
+#[derive(
+    Clone, Copy, Debug, displaydoc::Display, PartialEq, thiserror::Error, TryFromPrimitive,
+)]
 #[repr(u16)]
 pub enum ResultCode {
-    /// Success. Will not be returned as an error.
+    /// The operation was completed successfully.
     Success,
 
     /// The server does not support this version of the protocol.
@@ -43,7 +45,7 @@ pub enum ResultCode {
     /// The server is not in a valid network state to perform the operation.
     NetworkFailure,
 
-    /// The server is lacking resources, such as open ports, to complete the operation.
+    /// The server is lacking resources to complete the operation.
     OutOfResources,
 
     /// The server does not support the requested operation.
@@ -64,8 +66,8 @@ pub enum OperationCode {
     MapTcp,
 }
 
-#[derive(Debug, thiserror::Error)]
 /// Errors that may occur when trying to map a port on the gateway, categorized by the root of the issue.
+#[derive(Debug, thiserror::Error)]
 pub enum Failure {
     /// Failed to bind, connect, read, or write to a UDP socket.
     #[error("UDP socket error: {0}")]
@@ -79,10 +81,25 @@ pub enum Failure {
     #[error("Invalid response: {0}")]
     InvalidResponse(String),
 
-    /// The gateway gave a valid response, but it was an error.
-    /// The `ResultCode` is guaranteed to not be `ResultCode::Success`.
-    #[error("Gateway error: {0}")]
-    ResultCode(ResultCode),
+    /// The server does not support this version of the protocol.
+    #[error("Server responded with code: Unsupported version: {0}")]
+    UnsupportedVersion(VersionCode),
+
+    /// The server did not authorize the operation.
+    #[error("Server responded with code: Not authorized")]
+    NotAuthorized,
+
+    /// The server is not in a valid network state to perform the operation.
+    #[error("Server responded with code: Network failure")]
+    NetworkFailure,
+
+    /// The server is lacking resources to complete the operation.
+    #[error("Server responded with code: Out of resources")]
+    OutOfResources,
+
+    /// The server does not support the requested operation.
+    #[error("Server responded with code: Unsupported opcode")]
+    UnsupportedOpcode,
 }
 impl From<RequestSendError> for Failure {
     fn from(e: RequestSendError) -> Self {
@@ -96,12 +113,8 @@ impl From<RequestSendError> for Failure {
 /// Attempt to complete the `ExternalAddress` operation.
 /// Returns the public IP address of the gateway.
 /// # Errors
-/// Returns a `natpmp::Failure` enum which decomposes into different errors depending on the cause:
-/// * `Socket` if there is an error using the UDP socket
-/// * `Timeout` if the gateway is not responding
-/// * `InvalidResponse` if the gateway gave an invalid response
-/// * `ResultCode` if the gateway gave a valid response, but it was an error. Will never return `ResultCode::Success` as an error.
-pub async fn try_external_address(
+/// Returns a `natpmp::Failure` enum which decomposes into different errors depending on the cause.
+pub async fn external_address(
     gateway: IpAddr,
     timeout_config: Option<TimeoutConfig>,
 ) -> Result<Ipv4Addr, Failure> {
@@ -112,7 +125,8 @@ pub async fn try_external_address(
 
     // Use a byte-buffer to read the response into.
     let mut reader = bytes::BytesMut::with_capacity(MAX_DATAGRAM_SIZE);
-    // Try to send the request data until a response is read, respecting the RFC recommended timeouts and retries counts.
+
+    // Try to send the request data until a response is read, respecting the RFC recommended timeouts and retry counts.
     let n = helpers::try_send_until_response(
         timeout_config.unwrap_or(TIMEOUT_CONFIG_DEFAULT),
         &socket,
@@ -134,14 +148,9 @@ pub async fn try_external_address(
 
     // Read and verify the version and operation bytes.
     let v = VersionCode::try_from(reader.get_u8())
-        .map_err(|v| Failure::InvalidResponse(format!("Invalid version: {v:#}")))?;
+        .map_err(|v| Failure::InvalidResponse(format!("Unknown version: {v:#}")))?;
     let op = response_to_opcode(reader.get_u8())
         .map_err(|o| Failure::InvalidResponse(format!("Invalid operation code: {o:#}")))?;
-    if v != VersionCode::NatPmp {
-        return Err(Failure::InvalidResponse(format!(
-            "Unsupported version: {v:?}"
-        )));
-    }
     if op != OperationCode::ExternalAddress {
         return Err(Failure::InvalidResponse(format!(
             "Incorrect opcode: {op:?}"
@@ -153,9 +162,21 @@ pub async fn try_external_address(
         .map_err(|r| Failure::InvalidResponse(format!("Invalid result code: {r:#}")))?;
     let _gateway_epoch_seconds = reader.get_u32();
 
-    if result_code != ResultCode::Success {
-        // The server gave us a correct response, but it was an error.
-        return Err(Failure::ResultCode(result_code));
+    // Map error result codes to a failure, otherwise continue.
+    match result_code {
+        ResultCode::Success => Ok(()),
+        ResultCode::UnsupportedVersion => Err(Failure::UnsupportedVersion(v)),
+        ResultCode::NotAuthorized => Err(Failure::NotAuthorized),
+        ResultCode::NetworkFailure => Err(Failure::NetworkFailure),
+        ResultCode::OutOfResources => Err(Failure::OutOfResources),
+        ResultCode::UnsupportedOpcode => Err(Failure::UnsupportedOpcode),
+    }?;
+
+    // Since the `ResultCode` is `Success`, the version should always be `NatPmp`.
+    if v != VersionCode::NatPmp {
+        return Err(Failure::InvalidResponse(format!(
+            "Invalid version not matching request: {v:?}"
+        )));
     }
 
     // The response was a success, read the remaining 4 bytes as the external IP.
@@ -173,12 +194,8 @@ pub async fn try_external_address(
 /// Will try to use the given external port if it is `Some`, otherwise it will let the gateway choose.
 /// Will request the specified lifetime if it is `Some`, otherwise it will use the RFC recommended lifetime.
 /// # Errors
-/// Returns a `natpmp::Failure` enum which decomposes into different errors depending on the cause:
-/// * `Socket` if there is an error using the UDP socket
-/// * `Timeout` if the gateway is not responding
-/// * `InvalidResponse` if the gateway gave an invalid response
-/// * `ResultCode` if the gateway gave a valid response, but it was an error. Will never return `ResultCode::Success` as an error.
-pub async fn try_port_mapping(
+/// Returns a `natpmp::Failure` enum which decomposes into different errors depending on the cause.
+pub async fn port_mapping(
     gateway: IpAddr,
     protocol: InternetProtocol,
     internal_port: NonZeroU16,
@@ -189,7 +206,7 @@ pub async fn try_port_mapping(
         external_port,
         lifetime_seconds,
         timeout_config,
-    } = try_port_mapping_internal(gateway, protocol, internal_port.get(), mapping_options).await?;
+    } = port_mapping_internal(gateway, protocol, internal_port.get(), mapping_options).await?;
     let external_port = NonZeroU16::new(external_port)
         .ok_or_else(|| Failure::InvalidResponse("Invalid external port of zero".to_owned()))?;
 
@@ -209,11 +226,7 @@ pub async fn try_port_mapping(
 /// Attempts to remove a NAT-PMP mapping on the gateway.
 /// Using a local port of `None` will remove all port mappings for our client with the given protocol.
 /// # Errors
-/// Returns a `natpmp::Failure` enum which decomposes into different errors depending on the cause:
-/// * `Socket` if there is an error using the UDP socket
-/// * `Timeout` if the gateway is not responding
-/// * `InvalidResponse` if the gateway gave an invalid response
-/// * `ResultCode` if the gateway gave a valid response, but it was an error. Will never return `ResultCode::Success` as an error.
+/// Returns a `natpmp::Failure` enum which decomposes into different errors depending on the cause.
 pub async fn try_drop_mapping(
     gateway: IpAddr,
     protocol: InternetProtocol,
@@ -221,12 +234,12 @@ pub async fn try_drop_mapping(
     timeout_config: Option<TimeoutConfig>,
 ) -> Result<(), Failure> {
     // Mapping deletion is specified by the same operation code and format as mapping creation.
-    // The difference is that the lifetime and external port must be set to `0` and an internal port of `0` will remove all mappings.
+    // The difference is that the lifetime and external port must be set to `0` and an internal port of `0` will remove all mappings for the protocol.
     let PortMappingInternal {
         external_port,
         lifetime_seconds,
         ..
-    } = try_port_mapping_internal(
+    } = port_mapping_internal(
         gateway,
         protocol,
         local_port.map_or(0, NonZeroU16::get),
@@ -257,7 +270,12 @@ struct PortMappingInternal {
 }
 
 /// Helper for attempting a port mapping with more permissive input.
-async fn try_port_mapping_internal(
+/// # Errors
+/// Returns a `natpmp::Failure` enum which decomposes into different errors depending on the cause.
+/// # Panics
+/// Panics if the `internal port` is `0` but does not have a valid "delete all" request.
+/// I.e., the `mapping_options.lifetime_seconds` must be `Some(0)` and the `mapping_options.external_port` must be `None`.
+async fn port_mapping_internal(
     gateway: IpAddr,
     protocol: InternetProtocol,
     internal_port: u16,
@@ -266,12 +284,12 @@ async fn try_port_mapping_internal(
     // Ensure that a local port of `0` is only used for valid "delete all" requests.
     // See the last paragraph of section 3.4, <https://www.rfc-editor.org/rfc/rfc6886#section-3.4>.
     #[cfg(debug_assertions)]
-    if internal_port == 0
-        && (mapping_options.lifetime_seconds.is_some_and(|l| l > 0)
-            || mapping_options.external_port.is_some())
-    {
-        return Err(Failure::ResultCode(ResultCode::NotAuthorized));
-    }
+    assert!(
+        internal_port != 0
+            || (mapping_options.lifetime_seconds.is_some_and(|l| l == 0)
+                && mapping_options.external_port.is_none()),
+        "Internal port can only be `0` for a valid 'delete all' request."
+    );
 
     let socket = helpers::new_socket(gateway)
         .await
@@ -291,11 +309,7 @@ async fn try_port_mapping_internal(
     bb.put_u8(req_op as u8);
     bb.put_u16(0); // Reserved.
     bb.put_u16(internal_port);
-    bb.put_u16(
-        mapping_options
-            .external_port
-            .map_or(0, std::num::NonZeroU16::get),
-    );
+    bb.put_u16(mapping_options.external_port.map_or(0, NonZeroU16::get));
     bb.put_u32(
         mapping_options
             .lifetime_seconds
@@ -328,14 +342,9 @@ async fn try_port_mapping_internal(
 
     // Read and verify the version and operation bytes.
     let v = VersionCode::try_from(bb.get_u8())
-        .map_err(|v| Failure::InvalidResponse(format!("Invalid version: {v:#}")))?;
+        .map_err(|v| Failure::InvalidResponse(format!("Unknown version: {v:#}")))?;
     let op = response_to_opcode(bb.get_u8())
         .map_err(|o| Failure::InvalidResponse(format!("Invalid operation code: {o:#}")))?;
-    if v != VersionCode::NatPmp {
-        return Err(Failure::InvalidResponse(format!(
-            "Unsupported version: {v:?}"
-        )));
-    }
     if op != req_op {
         return Err(Failure::InvalidResponse(format!(
             "Incorrect opcode: {op:?}"
@@ -343,16 +352,28 @@ async fn try_port_mapping_internal(
     };
 
     // Read and verify the result code.
-    let response_code = ResultCode::try_from(bb.get_u16())
+    let result_code = ResultCode::try_from(bb.get_u16())
         .map_err(|r| Failure::InvalidResponse(format!("Invalid result code: {r:#}")))?;
     let gateway_epoch_seconds = bb.get_u32();
 
-    if response_code != ResultCode::Success {
-        // The server gave us a correct response, but it was an error.
-        return Err(Failure::ResultCode(response_code));
+    // Map error result codes to a failure, otherwise continue.
+    match result_code {
+        ResultCode::Success => Ok(()),
+        ResultCode::UnsupportedVersion => Err(Failure::UnsupportedVersion(v)),
+        ResultCode::NotAuthorized => Err(Failure::NotAuthorized),
+        ResultCode::NetworkFailure => Err(Failure::NetworkFailure),
+        ResultCode::OutOfResources => Err(Failure::OutOfResources),
+        ResultCode::UnsupportedOpcode => Err(Failure::UnsupportedOpcode),
+    }?;
+
+    // Since the `ResultCode` is `Success`, the version should always be `NatPmp`.
+    if v != VersionCode::NatPmp {
+        return Err(Failure::InvalidResponse(format!(
+            "Invalid version not matching request: {v:?}"
+        )));
     }
 
-    // The response was a success, read the mapping information.
+    // Validate that the response corresponds to the reqeusted internal port.
     let response_internal_port = bb.get_u16();
     if response_internal_port != internal_port {
         return Err(Failure::InvalidResponse(format!(
@@ -360,6 +381,7 @@ async fn try_port_mapping_internal(
         )));
     }
 
+    // The response was a success, read the mapping information.
     let external_port = bb.get_u16();
     let lifetime_seconds = bb.get_u32();
 

@@ -939,17 +939,18 @@ fn validate_base_response(bb: &mut bytes::BytesMut) -> Result<ResponseHeader, Fa
     })
 }
 
-/// Request `OperationCode` bits are the same as the abstract `OperationCode`s, but left shifted by one.
+/// Request `OperationCode` bits are the same as the abstract
+/// `OperationCode`s but with MSb `R` bit (MSb) unset.
 fn opcode_to_request(op: OperationCode) -> u8 {
-    (op as u8) << 1
+    op as u8 & 0x7F
 }
 
-/// Response `OperationCode` bits are the same as the request `OperationCode`s, but with the `1` bit set.
-/// This function right shifts to align with the 7 bit code and attempts to parse as an `OperationCode`.
+/// Response `OperationCode` bits are the same as the request
+/// `OperationCode`s, but mask out `R` bit (MSb).
 fn response_to_opcode(
     op: u8,
 ) -> Result<OperationCode, num_enum::TryFromPrimitiveError<OperationCode>> {
-    OperationCode::try_from(op >> 1)
+    OperationCode::try_from(op & 0x7F)
 }
 
 /// Convert the `InternetProtocol` enum into the byte expected by the PCP protocol.

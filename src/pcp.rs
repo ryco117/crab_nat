@@ -817,6 +817,7 @@ async fn try_send_map_request(
 }
 
 /// Information contained in a valid PCP response header for this version.
+#[derive(Debug)]
 struct ResponseHeader {
     pub lifetime_seconds: u32,
     pub gateway_epoch_seconds: u32,
@@ -897,7 +898,15 @@ fn validate_base_response(bb: &mut bytes::BytesMut) -> Result<ResponseHeader, Fa
             "Unsupported version: {v:?}"
         )));
     }
-    let op = response_to_opcode(bb.get_u8())
+
+    let r_opcode_octet = bb.get_u8();
+    if r_opcode_octet & 0x80 == 0 {
+        return Err(Failure::InvalidResponse(format!(
+            "Response R bit (MSb) must be set: {r_opcode_octet:08b}"
+        )));
+    }
+
+    let op = response_to_opcode(r_opcode_octet)
         .map_err(|op| Failure::InvalidResponse(format!("Invalid operation code: {op:#}")))?;
     if op != OperationCode::Map {
         return Err(Failure::InvalidResponse(format!(
@@ -1179,3 +1188,6 @@ impl PortMappingAllPorts {
         self.expiration
     }
 }
+
+#[cfg(test)]
+mod tests;

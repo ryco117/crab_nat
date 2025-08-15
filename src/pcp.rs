@@ -508,7 +508,8 @@ pub async fn peer_mapping(
 
     // PCP Requires a random value in [0.9, 1.1] be multiplied by the timeout.
     // <https://www.rfc-editor.org/rfc/rfc6887#section-8.1.1> Expands on PCP timing in detail.
-    let dist = rand::distr::Uniform::try_from(0.9..=1.1).expect("Failed to initialize uniform distribution");
+    let dist = rand::distr::Uniform::try_from(0.9..=1.1)
+        .expect("Failed to initialize uniform distribution");
     let fuzz_timeout = |wait: Duration| wait.mul_f64(rand::rng().sample(dist));
 
     // Try to get a response from the gateway.
@@ -803,7 +804,8 @@ async fn try_send_map_request(
 
     // PCP Requires a random value in [0.9, 1.1] be multiplied by the timeout.
     // <https://www.rfc-editor.org/rfc/rfc6887#section-8.1.1> Expands on PCP timing in detail.
-    let dist = rand::distr::Uniform::try_from(0.9..=1.1).expect("Failed to initialize uniform distribution");
+    let dist = rand::distr::Uniform::try_from(0.9..=1.1)
+        .expect("Failed to initialize uniform distribution");
     let fuzz_timeout = |wait: Duration| wait.mul_f64(rand::rng().sample(dist));
 
     let n =
@@ -815,6 +817,7 @@ async fn try_send_map_request(
 }
 
 /// Information contained in a valid PCP response header for this version.
+#[derive(Debug)]
 struct ResponseHeader {
     pub lifetime_seconds: u32,
     pub gateway_epoch_seconds: u32,
@@ -845,7 +848,7 @@ fn write_base_request(
 
     // Create the common PCP request header.
     bb.put_u8(VersionCode::Pcp as u8);
-    bb.put_u8(opcode_to_request(op));
+    bb.put_u8(op as u8); // Opcode with R bit unset.
     bb.put_u16(0); // Reserved.
     bb.put_u32(lifetime_seconds);
     bb.put(&client_ip6.octets()[..]);
@@ -895,7 +898,15 @@ fn validate_base_response(bb: &mut bytes::BytesMut) -> Result<ResponseHeader, Fa
             "Unsupported version: {v:?}"
         )));
     }
-    let op = response_to_opcode(bb.get_u8())
+
+    let r_opcode_octet = bb.get_u8();
+    if r_opcode_octet & 0x80 == 0 {
+        return Err(Failure::InvalidResponse(format!(
+            "Response R bit (MSb) must be set: {r_opcode_octet:08b}"
+        )));
+    }
+
+    let op = response_to_opcode(r_opcode_octet)
         .map_err(|op| Failure::InvalidResponse(format!("Invalid operation code: {op:#}")))?;
     if op != OperationCode::Map {
         return Err(Failure::InvalidResponse(format!(
@@ -937,17 +948,12 @@ fn validate_base_response(bb: &mut bytes::BytesMut) -> Result<ResponseHeader, Fa
     })
 }
 
-/// Request `OperationCode` bits are the same as the abstract `OperationCode`s, but left shifted by one.
-fn opcode_to_request(op: OperationCode) -> u8 {
-    (op as u8) << 1
-}
-
-/// Response `OperationCode` bits are the same as the request `OperationCode`s, but with the `1` bit set.
-/// This function right shifts to align with the 7 bit code and attempts to parse as an `OperationCode`.
+/// Response `OperationCode` bits are the same as the request
+/// `OperationCode`s, but mask out `R` bit (MSb).
 fn response_to_opcode(
     op: u8,
 ) -> Result<OperationCode, num_enum::TryFromPrimitiveError<OperationCode>> {
-    OperationCode::try_from(op >> 1)
+    OperationCode::try_from(op & 0x7F)
 }
 
 /// Convert the `InternetProtocol` enum into the byte expected by the PCP protocol.
@@ -1176,3 +1182,6 @@ impl PortMappingAllPorts {
         self.expiration
     }
 }
+
+#[cfg(test)]
+mod tests;

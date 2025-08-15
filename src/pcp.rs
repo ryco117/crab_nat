@@ -848,7 +848,7 @@ fn write_base_request(
 
     // Create the common PCP request header.
     bb.put_u8(VersionCode::Pcp as u8);
-    bb.put_u8(opcode_to_request(op));
+    bb.put_u8(op as u8); // Opcode with R bit unset.
     bb.put_u16(0); // Reserved.
     bb.put_u32(lifetime_seconds);
     bb.put(&client_ip6.octets()[..]);
@@ -946,12 +946,6 @@ fn validate_base_response(bb: &mut bytes::BytesMut) -> Result<ResponseHeader, Fa
         lifetime_seconds,
         gateway_epoch_seconds,
     })
-}
-
-/// Request `OperationCode` bits are the same as the abstract
-/// `OperationCode`s but with MSb `R` bit (MSb) unset.
-fn opcode_to_request(op: OperationCode) -> u8 {
-    op as u8 & 0x7F
 }
 
 /// Response `OperationCode` bits are the same as the request

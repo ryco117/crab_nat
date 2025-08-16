@@ -406,7 +406,7 @@ mod helpers {
                     wait += wait;
 
                     // Limit the timeout to the configured maximum.
-                    // This was added to in PCP RFC, but is supported here for both protocols.
+                    // This was added with the PCP RFC, but is supported here for both protocols.
                     if let Some(max) = timeout_config.max_retry_timeout {
                         if wait > max {
                             wait = max;
@@ -432,18 +432,8 @@ mod helpers {
 #[derive(Debug, thiserror::Error)]
 pub enum MappingFailure {
     #[error("NAT-PMP({0})")]
-    NatPmp(natpmp::Failure),
+    NatPmp(#[from] natpmp::Failure),
 
     #[error("PCP({0})")]
-    Pcp(pcp::Failure),
-}
-impl From<natpmp::Failure> for MappingFailure {
-    fn from(f: natpmp::Failure) -> Self {
-        MappingFailure::NatPmp(f)
-    }
-}
-impl From<pcp::Failure> for MappingFailure {
-    fn from(f: pcp::Failure) -> Self {
-        MappingFailure::Pcp(f)
-    }
+    Pcp(#[from] pcp::Failure),
 }

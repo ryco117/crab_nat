@@ -31,6 +31,7 @@ fn test_validate_base_response_unsupported_version() {
         if msg.contains("Unknown version")
     ));
 }
+
 #[test]
 fn test_validate_base_response_unset_r_bit() {
     // Correct length and version but R bit is not set
@@ -43,6 +44,7 @@ fn test_validate_base_response_unset_r_bit() {
         if msg.contains("Response R bit (MSb) must be set")
     ));
 }
+
 #[test]
 fn test_validate_base_response_success() {
     // 24 bytes, correct version, opcode, result code = Success

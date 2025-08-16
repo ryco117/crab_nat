@@ -349,7 +349,7 @@ async fn port_mapping_internal(
         return Err(Failure::InvalidResponse(format!(
             "Incorrect opcode: {op:?}"
         )));
-    };
+    }
 
     // Read and verify the result code.
     let result_code = ResultCode::try_from(bb.get_u16())

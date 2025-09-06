@@ -266,6 +266,7 @@ impl PortMapping {
             )
             .await
             .map_err(|e| (MappingFailure::from(e), self)),
+
             PortMappingType::Pcp { client, nonce, .. } => pcp::try_drop_mapping(
                 gateway,
                 client,

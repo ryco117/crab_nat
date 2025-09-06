@@ -863,7 +863,7 @@ fn validate_base_response(bb: &mut bytes::BytesMut) -> Result<ResponseHeader, Fa
     if n < 24 {
         let header_bytes = &bb[..n];
 
-        // Both NAT-PMP and PCP responses have compatible 4-byte headers.
+        // NAT-PMP and PCP response headers are compatible within the first 4 bytes.
         if n >= 4 {
             let version = header_bytes[0].try_into().map_err(|_| {
                 Failure::InvalidResponse(format!("Unknown version: {:X?}", header_bytes[0]))

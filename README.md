@@ -31,6 +31,8 @@ if let Err((e, m)) = mapping.try_drop().await {
 }
 ```
 
+If there is a preference on which protocol to use then you can access the `natpmp` and `pcp` modules directly.
+
 Crab NAT does not determine the gateway address or the local client address. This is to reduce unnecessary assumptions about how this library will be used. For an easy API to determine these values reliably, I recommend using [netdev](https://crates.io/crates/netdev); see the example [client](examples/client.rs) for basic usage.
 
 ### Crate Features

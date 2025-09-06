@@ -16,8 +16,11 @@ use crate::{
 /// The RFC states that the first response timeout SHOULD be 250 milliseconds, and double on each successive failure.
 pub const FIRST_TIMEOUT_MILLIS: u64 = 250;
 
-/// NAT-PMP does not require datagrams larger than 16 bytes.
-pub const MAX_DATAGRAM_SIZE: usize = 16;
+/// Mapping requests have datagrams of size 12 bytes, see <https://www.rfc-editor.org/rfc/rfc6886#section-3.3>.
+pub const REQUEST_DATAGRAM_SIZE: usize = 12;
+
+/// Mapping responses have datagrams of size 16 bytes, see <https://www.rfc-editor.org/rfc/rfc6886#section-3.3>.
+pub const RESPONSE_DATAGRAM_SIZE: usize = 16;
 
 /// The default `TimeoutConfig` for NAT-PMP requests.
 pub const TIMEOUT_CONFIG_DEFAULT: TimeoutConfig = TimeoutConfig {
@@ -110,6 +113,19 @@ impl From<RequestSendError> for Failure {
     }
 }
 
+/// Helper to map result codes to a more standard `Result` pattern.
+pub fn code_to_result(result_code: ResultCode, v: VersionCode) -> Result<(), Failure> {
+    // Map error result codes to a failure, otherwise continue.
+    match result_code {
+        ResultCode::Success => Ok(()),
+        ResultCode::UnsupportedVersion => Err(Failure::UnsupportedVersion(v)),
+        ResultCode::NotAuthorized => Err(Failure::NotAuthorized),
+        ResultCode::NetworkFailure => Err(Failure::NetworkFailure),
+        ResultCode::OutOfResources => Err(Failure::OutOfResources),
+        ResultCode::UnsupportedOpcode => Err(Failure::UnsupportedOpcode),
+    }
+}
+
 /// Attempt to complete the `ExternalAddress` operation.
 /// Returns the public IP address of the gateway.
 /// # Errors
@@ -118,13 +134,17 @@ pub async fn external_address(
     gateway: IpAddr,
     timeout_config: Option<TimeoutConfig>,
 ) -> Result<Ipv4Addr, Failure> {
+    /// External address responses have datagrams of size 12 bytes, see <https://www.rfc-editor.org/rfc/rfc6886#section-3.2>.
+    const ADDRESS_RESPONSE_SIZE: usize = 12;
+
     // Create a new UDP socket and connect to the gateway.
     let socket = helpers::new_socket(gateway)
         .await
         .map_err(Failure::Socket)?;
 
     // Use a byte-buffer to read the response into.
-    let mut reader = bytes::BytesMut::with_capacity(MAX_DATAGRAM_SIZE);
+    let mut recv_buffer = [0; ADDRESS_RESPONSE_SIZE];
+    let mut recv = &mut recv_buffer[..];
 
     // Try to send the request data until a response is read, respecting the RFC recommended timeouts and retry counts.
     let n = helpers::try_send_until_response(
@@ -134,17 +154,18 @@ pub async fn external_address(
             VersionCode::NatPmp as u8,
             OperationCode::ExternalAddress as u8,
         ],
-        &mut reader,
+        &mut recv,
         std::convert::identity,
     )
     .await?;
 
     // An `ExternalAddress` response is always expected to be 12 bytes.
-    if n != 12 {
+    if n != ADDRESS_RESPONSE_SIZE {
         return Err(Failure::InvalidResponse(format!(
             "Incorrect number of bytes: {n}"
         )));
     }
+    let mut reader = &recv_buffer[..ADDRESS_RESPONSE_SIZE];
 
     // Read and verify the version and operation bytes.
     let v = VersionCode::try_from(reader.get_u8())
@@ -163,14 +184,7 @@ pub async fn external_address(
     let _gateway_epoch_seconds = reader.get_u32();
 
     // Map error result codes to a failure, otherwise continue.
-    match result_code {
-        ResultCode::Success => Ok(()),
-        ResultCode::UnsupportedVersion => Err(Failure::UnsupportedVersion(v)),
-        ResultCode::NotAuthorized => Err(Failure::NotAuthorized),
-        ResultCode::NetworkFailure => Err(Failure::NetworkFailure),
-        ResultCode::OutOfResources => Err(Failure::OutOfResources),
-        ResultCode::UnsupportedOpcode => Err(Failure::UnsupportedOpcode),
-    }?;
+    code_to_result(result_code, v)?;
 
     // Since the `ResultCode` is `Success`, the version should always be `NatPmp`.
     if v != VersionCode::NatPmp {
@@ -273,7 +287,7 @@ struct PortMappingInternal {
 /// # Errors
 /// Returns a `natpmp::Failure` enum which decomposes into different errors depending on the cause.
 /// # Panics
-/// Panics if the `internal port` is `0` but does not have a valid "delete all" request.
+/// Panics if `internal_port` is `0` but does not have a valid "delete all" request.
 /// I.e., the `mapping_options.lifetime_seconds` must be `Some(0)` and the `mapping_options.external_port` must be `None`.
 async fn port_mapping_internal(
     gateway: IpAddr,
@@ -302,48 +316,51 @@ async fn port_mapping_internal(
     };
 
     // Create a byte-buffer with enough space for the request and response bytes.
-    let mut bb = bytes::BytesMut::with_capacity(MAX_DATAGRAM_SIZE << 1);
+    let mut send_buffer = [0; REQUEST_DATAGRAM_SIZE];
+    let mut send = &mut send_buffer[..];
 
     // Format the port mapping request.
-    bb.put_u8(VersionCode::NatPmp as u8);
-    bb.put_u8(req_op as u8);
-    bb.put_u16(0); // Reserved.
-    bb.put_u16(internal_port);
-    bb.put_u16(mapping_options.external_port.map_or(0, NonZeroU16::get));
-    bb.put_u32(
+    send.put_u8(VersionCode::NatPmp as u8);
+    send.put_u8(req_op as u8);
+    send.put_u16(0); // Reserved.
+    send.put_u16(internal_port);
+    send.put_u16(mapping_options.external_port.map_or(0, NonZeroU16::get));
+    send.put_u32(
         mapping_options
             .lifetime_seconds
             .unwrap_or(RECOMMENDED_MAPPING_LIFETIME_SECONDS),
     );
 
-    // Split the byte buffer into a send buffer and a receive buffer.
-    let send_buf = bb.split();
-
     let timeout_config = mapping_options
         .timeout_config
         .unwrap_or(TIMEOUT_CONFIG_DEFAULT);
+
+    // Use a byte-buffer to read the response into.
+    let mut recv_buffer = [0; RESPONSE_DATAGRAM_SIZE];
+    let mut recv = &mut recv_buffer[..];
 
     // Try to send the request data until a response is read, respecting the RFC recommended timeouts and retries counts.
     let n = helpers::try_send_until_response(
         timeout_config,
         &socket,
-        &send_buf,
-        &mut bb,
+        &send_buffer[..REQUEST_DATAGRAM_SIZE],
+        &mut recv,
         std::convert::identity,
     )
     .await?;
 
     // A port mapping response is always expected to be 16 bytes.
-    if n != 16 {
+    if n != RESPONSE_DATAGRAM_SIZE {
         return Err(Failure::InvalidResponse(format!(
             "Incorrect number of bytes: {n}"
         )));
     }
+    let mut recv = &recv_buffer[..RESPONSE_DATAGRAM_SIZE];
 
     // Read and verify the version and operation bytes.
-    let v = VersionCode::try_from(bb.get_u8())
+    let v = VersionCode::try_from(recv.get_u8())
         .map_err(|v| Failure::InvalidResponse(format!("Unknown version: {v:#}")))?;
-    let op = response_to_opcode(bb.get_u8())
+    let op = response_to_opcode(recv.get_u8())
         .map_err(|o| Failure::InvalidResponse(format!("Invalid operation code: {o:#}")))?;
     if op != req_op {
         return Err(Failure::InvalidResponse(format!(
@@ -352,19 +369,12 @@ async fn port_mapping_internal(
     }
 
     // Read and verify the result code.
-    let result_code = ResultCode::try_from(bb.get_u16())
+    let result_code = ResultCode::try_from(recv.get_u16())
         .map_err(|r| Failure::InvalidResponse(format!("Invalid result code: {r:#}")))?;
-    let gateway_epoch_seconds = bb.get_u32();
+    let gateway_epoch_seconds = recv.get_u32();
 
     // Map error result codes to a failure, otherwise continue.
-    match result_code {
-        ResultCode::Success => Ok(()),
-        ResultCode::UnsupportedVersion => Err(Failure::UnsupportedVersion(v)),
-        ResultCode::NotAuthorized => Err(Failure::NotAuthorized),
-        ResultCode::NetworkFailure => Err(Failure::NetworkFailure),
-        ResultCode::OutOfResources => Err(Failure::OutOfResources),
-        ResultCode::UnsupportedOpcode => Err(Failure::UnsupportedOpcode),
-    }?;
+    code_to_result(result_code, v)?;
 
     // Since the `ResultCode` is `Success`, the version should always be `NatPmp`.
     if v != VersionCode::NatPmp {
@@ -374,7 +384,7 @@ async fn port_mapping_internal(
     }
 
     // Validate that the response corresponds to the requested internal port.
-    let response_internal_port = bb.get_u16();
+    let response_internal_port = recv.get_u16();
     if response_internal_port != internal_port {
         return Err(Failure::InvalidResponse(format!(
             "Incorrect internal port: {response_internal_port}, expected {internal_port}"
@@ -382,8 +392,8 @@ async fn port_mapping_internal(
     }
 
     // The response was a success, read the mapping information.
-    let external_port = bb.get_u16();
-    let lifetime_seconds = bb.get_u32();
+    let external_port = recv.get_u16();
+    let lifetime_seconds = recv.get_u32();
 
     Ok(PortMappingInternal {
         gateway_epoch_seconds,

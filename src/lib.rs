@@ -74,17 +74,24 @@ impl std::fmt::Display for VersionCode {
 }
 
 /// Specifies the protocol to map a port for.
+/// Values are defined to match the opcodes in the NAT-PMP RFC, here <https://www.rfc-editor.org/rfc/rfc6886#section-3.3>.
 #[repr(u8)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, displaydoc::Display)]
 pub enum InternetProtocol {
+    /// UDP
     Udp = 1,
+
+    /// TCP
     Tcp,
 }
 
 /// Specifies a port mapping protocol, as well as any protocol specific parameters.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, displaydoc::Display)]
 pub enum PortMappingType {
+    /// NAT-PMP
     NatPmp,
+
+    /// PCP
     Pcp {
         /// Our address as seen by the PCP server.
         client: IpAddr,
@@ -358,21 +365,22 @@ mod helpers {
     /// * Failed to send data on the socket
     /// * Failed to receive data on the socket
     /// Otherwise, will return a `Timeout` error if the gateway could not be reached after all retries.
-    pub async fn try_send_until_response<F>(
+    pub async fn try_send_until_response<B, F>(
         timeout_config: TimeoutConfig,
         socket: &UdpSocket,
         send_bytes: &[u8],
-        recv_buf: &mut bytes::BytesMut,
+        recv_buf: &mut B,
         fuzz_timeout: F,
     ) -> Result<usize, RequestSendError>
     where
+        B: bytes::BufMut,
         F: Fn(Duration) -> Duration,
     {
         // Internal helper to try sending and receiving packets; will springboard errors back to the caller.
-        async fn send_and_recv(
+        async fn send_and_recv<B: bytes::BufMut>(
             socket: &UdpSocket,
             send_bytes: &[u8],
-            recv_buf: &mut bytes::BytesMut,
+            recv_buf: &mut B,
             timeout: Duration,
         ) -> Result<usize, RequestSendError> {
             socket

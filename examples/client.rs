@@ -5,7 +5,7 @@ use crab_nat::PortMappingOptions;
 /// A simple command line utility to manage NAT-PMP and PCP port mappings.
 #[derive(clap::Parser)]
 struct Cli {
-    /// Delete the port mapping on exit.
+    /// Delete the port mapping on exit. Useful only for testing/debugging.
     #[arg(short, long)]
     delete: bool,
 
@@ -61,7 +61,7 @@ async fn main() {
                 .expect("Invalid local address, must be an IP address")
         },
     );
-    tracing::info!("Using local address: {local_address:#}");
+    tracing::info!("Using local address: {local_address}");
 
     // Get the gateway address from the command line or guess the default.
     let gateway = args.gateway.filter(|g| !g.is_empty()).map_or_else(
@@ -104,7 +104,7 @@ async fn main() {
                 .expect("Invalid gateway, must be an IP address")
         },
     );
-    tracing::info!("Using gateway address: {gateway:#}");
+    tracing::info!("Using gateway address: {gateway}");
 
     // If the delete all flag is set, attempt to delete all mappings for the protocol and exit.
     if args.delete_all {
@@ -113,7 +113,7 @@ async fn main() {
             .unwrap_or_else(|e| {
                 tracing::error!("Failed to delete mappings: {e:#}");
             });
-        tracing::info!("Successfully deleted all mappings for protocol {protocol:?}");
+        tracing::info!("Successfully deleted all mappings for protocol {protocol}");
         return;
     }
 
@@ -123,7 +123,7 @@ async fn main() {
             Ok(ip) => ip,
             Err(e) => return tracing::error!("Failed to get external IP: {e:#}"),
         };
-        return tracing::info!("External IP: {external_ip:#}");
+        return tracing::info!("External IP: {external_ip}");
     }
 
     // Attempt a port mapping request.
@@ -149,13 +149,13 @@ async fn main() {
     let mapping_type = mapping.mapping_type();
 
     // Print the mapped port information.
-    tracing::info!("Successfully mapped protocol {protocol:?} on external port {external_port} to internal port {internal_port} with a lifetime of {lifetime:?} seconds using {mapping_type:?}");
+    tracing::info!("Successfully mapped protocol {protocol} on external port {external_port} to internal port {internal_port} with a lifetime of {lifetime} seconds using {mapping_type}");
 
     if args.delete {
         // Try to safely drop the mapping.
         if let Err((e, m)) = mapping.try_drop().await {
             tracing::error!(
-                "Failed to drop mapping {protocol:?} {gateway}:{}->{}: {e:?}",
+                "Failed to drop mapping {protocol} {gateway}:{}->{}: {e:#}",
                 m.external_port(),
                 m.internal_port()
             );

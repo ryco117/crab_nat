@@ -114,6 +114,8 @@ impl From<RequestSendError> for Failure {
 }
 
 /// Helper to map result codes to a more standard `Result` pattern.
+/// # Errors
+/// Every `ResultCode` except `ResultCode::Success` will return a `Failure` aligning with the respective error.
 pub fn code_to_result(result_code: ResultCode, v: VersionCode) -> Result<(), Failure> {
     // Map error result codes to a failure, otherwise continue.
     match result_code {

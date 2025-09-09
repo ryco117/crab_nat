@@ -949,7 +949,7 @@ fn validate_base_response(bb: &mut bytes::BytesMut) -> Result<ResponseHeader, Fa
 }
 
 /// Response `OperationCode` bits are the same as the request
-/// `OperationCode`s, but mask out `R` bit (MSb).
+/// `OperationCode`s, but mask out the `R` bit (Most significant bit).
 fn response_to_opcode(
     op: u8,
 ) -> Result<OperationCode, num_enum::TryFromPrimitiveError<OperationCode>> {

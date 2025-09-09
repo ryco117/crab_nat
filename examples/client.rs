@@ -36,6 +36,10 @@ struct Cli {
     /// The protocol to map. Either "tcp" or "udp".
     #[arg(short, long, default_value = "udp")]
     internet_protocol: String,
+
+    /// Auto renew the mapping in a loop. This will keep the mapping alive until the program is terminated.
+    #[arg(short = 'r', long)]
+    renew: bool,
 }
 
 #[tokio::main]
@@ -127,7 +131,7 @@ async fn main() {
     }
 
     // Attempt a port mapping request.
-    let mapping = match crab_nat::PortMapping::new(
+    let mut mapping = match crab_nat::PortMapping::new(
         gateway,
         local_address,
         protocol,
@@ -150,6 +154,36 @@ async fn main() {
 
     // Print the mapped port information.
     tracing::info!("Successfully mapped protocol {protocol} on external port {external_port} to internal port {internal_port} with a lifetime of {lifetime} seconds using {mapping_type}");
+
+    if args.renew {
+        tracing::info!("Starting auto-renew loop for the mapping...");
+
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!("Received termination signal, exiting auto-renew loop...");
+            }
+
+            _ = async {
+                loop {
+                    // First attempt to renew the mapping halfway through its lifetime. <https://www.rfc-editor.org/rfc/rfc6886#page-13>
+                    let sleep_duration = tokio::time::Duration::from_secs(lifetime as u64) / 2;
+                    tracing::info!("Sleeping for {} seconds before attempting to renew the mapping...", sleep_duration.as_secs());
+                    tokio::time::sleep(sleep_duration).await;
+                    match mapping.renew().await {
+                        Ok(_) => {
+                            tracing::info!("Successfully renewed mapping");
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to renew mapping: {e:#}");
+                            break;
+                        }
+                    }
+                }
+            } => {
+                tracing::info!("Exiting auto-renew loop due to mapping failure...");
+            }
+        }
+    }
 
     if args.delete {
         // Try to safely drop the mapping.

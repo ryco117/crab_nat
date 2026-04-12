@@ -458,6 +458,8 @@ pub struct PeerMapping {
 /// Attempts to open a mapping to a remote peer's socket address.
 /// # Errors
 /// Returns a `pcp::Failure` enum which decomposes into different errors depending on the cause.
+/// # Panics
+/// Panics if unable to construct `rand::distr::Uniform`, which should never happen since the range is valid.
 pub async fn peer_mapping(
     base: BaseMapRequest,
     session_nonce: Option<Nonce>,
@@ -747,6 +749,8 @@ enum MappingRange {
 }
 
 /// Helper function to try to create and send a PCP request and return the gateway's response, if any.
+/// # Panics
+/// Panics if unable to construct `rand::distr::Uniform`, which should never happen since the range is valid.
 async fn try_send_map_request(
     gateway: IpAddr,
     client: IpAddr,

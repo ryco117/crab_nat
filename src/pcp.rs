@@ -4,8 +4,8 @@ use std::{
     time::Duration,
 };
 
-use bytes::{Buf as _, BufMut as _, BytesMut};
-use rand::Rng as _;
+use bytes::{Buf, BufMut};
+use rand::RngExt as _;
 
 use crate::{
     helpers::{self, RequestSendError},
@@ -34,6 +34,9 @@ pub const TIMEOUT_CONFIG_DEFAULT: TimeoutConfig = TimeoutConfig {
 
 /// A unique session identifier for a PCP client.
 pub type Nonce = [u32; 3];
+
+/// All valid PCP requests and responses have at least 24 bytes for their header, see <https://www.rfc-editor.org/rfc/rfc6887#section-7>.
+const HEADER_SIZE: usize = 24;
 
 /// Valid result codes from a PCP response.
 /// See <https://www.rfc-editor.org/rfc/rfc6887#section-7.4>.
@@ -476,14 +479,16 @@ pub async fn peer_mapping(
         .map_err(Failure::Socket)?;
 
     // Create a bit-stream friendly scratch space.
-    let mut bb = bytes::BytesMut::with_capacity(MAX_DATAGRAM_SIZE << 1);
+    // NOTE: Always ensure we are allocating the exact correct size here.
+    let mut send_buffer = [0; HEADER_SIZE + 56];
+    let mut send_bb = &mut send_buffer[..];
 
     // Write the common PCP request header.
     let suggested_ip = write_base_request(
-        OperationCode::Map,
+        OperationCode::Peer,
         base.client,
         suggested_external_ip,
-        &mut bb,
+        &mut send_bb,
         mapping_options
             .lifetime_seconds
             .unwrap_or(RECOMMENDED_MAPPING_LIFETIME_SECONDS),
@@ -493,18 +498,20 @@ pub async fn peer_mapping(
     let (remote_ip, remote_port) = (remote_address.ip(), remote_address.port());
 
     // Write the peer specific request.
-    bb.put_u32(nonce[0]);
-    bb.put_u32(nonce[1]);
-    bb.put_u32(nonce[2]);
-    bb.put_u8(protocol_to_byte(base.protocol));
-    bb.put(&[0u8; 3][..]); // Reserved.
-    bb.put_u16(base.internal_port.get());
-    bb.put_u16(mapping_options.external_port.map_or(0, NonZeroU16::get));
-    bb.put(&suggested_ip.octets()[..]);
-    bb.put_u16(remote_port);
-    bb.put_u16(0); // Reserved.
-    bb.put(&fixed_size_addr(remote_ip).octets()[..]);
-    let request = bb.split();
+    send_bb.put_u32(nonce[0]);
+    send_bb.put_u32(nonce[1]);
+    send_bb.put_u32(nonce[2]);
+    send_bb.put_u8(protocol_to_byte(base.protocol));
+    send_bb.put(&[0u8; 3][..]); // Reserved.
+    send_bb.put_u16(base.internal_port.get());
+    send_bb.put_u16(mapping_options.external_port.map_or(0, NonZeroU16::get));
+    send_bb.put(&suggested_ip.octets()[..]);
+    send_bb.put_u16(remote_port);
+    send_bb.put_u16(0); // Reserved.
+    send_bb.put(&fixed_size_addr(remote_ip).octets()[..]);
+
+    let mut recv_buffer = [0; MAX_DATAGRAM_SIZE];
+    let mut recv_bb = &mut recv_buffer[..];
 
     // PCP Requires a random value in [0.9, 1.1] be multiplied by the timeout.
     // <https://www.rfc-editor.org/rfc/rfc6887#section-8.1.1> Expands on PCP timing in detail.
@@ -513,44 +520,49 @@ pub async fn peer_mapping(
     let fuzz_timeout = |wait: Duration| wait.mul_f64(rand::rng().sample(dist));
 
     // Try to get a response from the gateway.
-    let n =
-        helpers::try_send_until_response(timeout_config, &socket, &request, &mut bb, fuzz_timeout)
-            .await
-            .map_err(Failure::from)?;
+    let n = helpers::try_send_until_response(
+        timeout_config,
+        &socket,
+        &send_buffer[..],
+        &mut recv_bb,
+        fuzz_timeout,
+    )
+    .await
+    .map_err(Failure::from)?;
 
     // Validate the response header.
-    let header = validate_base_response(&mut bb)?;
+    let mut recv_bb = &recv_buffer[..n];
+    let header = validate_base_response(&mut recv_bb, OperationCode::Peer)?;
 
     // Ensure we can read the rest of the peer response.
     if n < 80 {
-        let bits = &bb[..n];
         return Err(Failure::InvalidResponse(format!(
-            "Too few bytes received: {n}, expected 80: {bits:X?}"
+            "Too few bytes received: {n}, expected at least 80"
         )));
     }
 
     // Validate the nonce.
-    validate_nonce(&mut bb, nonce)?;
+    validate_nonce(&mut recv_bb, nonce)?;
 
     // Validate the internet protocol.
-    validate_protocol(&mut bb, Some(base.protocol))?;
+    validate_protocol(&mut recv_bb, Some(base.protocol))?;
 
-    bb.advance(3); // Reserved.
+    recv_bb.advance(3); // Reserved.
 
     // Validate the internal port.
     let internal_port = base.internal_port;
-    validate_port(&mut bb, internal_port.get()).map_err(|r| {
+    validate_port(&mut recv_bb, internal_port.get()).map_err(|r| {
         Failure::InvalidResponse(format!(
             "Incorrect internal port {r}, expected {internal_port}"
         ))
     })?;
 
     // The external port assigned to our mapping. The server may not use the requested port, if present.
-    let external_port = NonZeroU16::new(bb.get_u16())
+    let external_port = NonZeroU16::new(recv_bb.get_u16())
         .ok_or_else(|| Failure::InvalidResponse("Received external port of 0".to_owned()))?;
 
     // The external IP address assigned to our mapping.
-    let external_ip = read_ip6_addr(&mut bb);
+    let external_ip = read_ip6_addr(&mut recv_bb);
     let external_ip = if let Some(ip) = external_ip.to_ipv4_mapped() {
         IpAddr::V4(ip)
     } else {
@@ -558,14 +570,14 @@ pub async fn peer_mapping(
     };
 
     // Validate the remote port.
-    validate_port(&mut bb, remote_port).map_err(|r| {
+    validate_port(&mut recv_bb, remote_port).map_err(|r| {
         Failure::InvalidResponse(format!("Incorrect remote port {r}, expected {remote_port}"))
     })?;
 
-    bb.advance(2); // Reserved.
+    recv_bb.advance(2); // Reserved.
 
     // Validate remote IP address.
-    let response_remote_ip = read_ip6_addr(&mut bb);
+    let response_remote_ip = read_ip6_addr(&mut recv_bb);
     let response_remote_ip = if let Some(ip) = response_remote_ip.to_ipv4_mapped() {
         IpAddr::V4(ip)
     } else {
@@ -644,28 +656,30 @@ async fn port_mapping_internal(
 
     // Use an existing session nonce or generate 96 new random bits.
     let nonce: Nonce = nonce.unwrap_or_else(|| [rand::random(), rand::random(), rand::random()]);
+    let mut recv_buffer = [0; MAX_DATAGRAM_SIZE];
 
-    let PcpResponse { n, mut bb } = try_send_map_request(
+    let PcpResponse { mut bb } = try_send_map_request(
         gateway,
         client,
         nonce,
         map_range,
         lifetime_seconds.unwrap_or(RECOMMENDED_MAPPING_LIFETIME_SECONDS),
         timeout_config,
+        &mut recv_buffer,
     )
     .await?;
+    let n = bb.len();
 
     // Validate the response header.
     let ResponseHeader {
         lifetime_seconds,
         gateway_epoch_seconds,
-    } = validate_base_response(&mut bb)?;
+    } = validate_base_response(&mut bb, OperationCode::Map)?;
 
     // Ensure we can read the rest of the map response.
     if n < 60 {
-        let bits = &bb[..n];
         return Err(Failure::InvalidResponse(format!(
-            "Too few bytes received: {n}, expected 60: {bits:X?}"
+            "Too few bytes received: {n}, expected at least 60"
         )));
     }
 
@@ -712,12 +726,9 @@ async fn port_mapping_internal(
 }
 
 /// Helper object to store the response from a PCP request, including the session nonce.
-struct PcpResponse {
-    /// The number of bytes in the response.
-    pub n: usize,
-
-    /// Bytestream containing the response. Only the first `n` bytes are valid.
-    pub bb: BytesMut,
+struct PcpResponse<'a> {
+    /// Bytestream containing the response.
+    pub bb: &'a [u8],
 }
 
 #[derive(Clone, Copy)]
@@ -742,14 +753,17 @@ async fn try_send_map_request(
     map_range: MappingRange,
     lifetime_seconds: u32,
     timeout_config: TimeoutConfig,
-) -> Result<PcpResponse, Failure> {
+    recv_buffer: &mut [u8; MAX_DATAGRAM_SIZE],
+) -> Result<PcpResponse<'_>, Failure> {
     // Create a new UDP socket to communicate with the gateway.
     let socket = helpers::new_socket(gateway)
         .await
         .map_err(Failure::Socket)?;
 
     // Create a bitstream-friendly scratch space.
-    let mut bb = bytes::BytesMut::with_capacity(MAX_DATAGRAM_SIZE << 1);
+    // NOTE: Always ensure we are allocating the exact correct size here.
+    let mut send_buffer = [0; HEADER_SIZE + 36];
+    let mut send_bb = &mut send_buffer[..];
 
     // Write the common PCP request header.
     let suggested_ip = write_base_request(
@@ -765,28 +779,28 @@ async fn try_send_map_request(
                 ..
             } => suggested_external_ip,
         },
-        &mut bb,
+        &mut send_bb,
         lifetime_seconds,
     );
 
     // Create the mapping specific request.
-    bb.put_u32(nonce[0]);
-    bb.put_u32(nonce[1]);
-    bb.put_u32(nonce[2]);
-    bb.put_u8(if let MappingRange::Single { protocol, .. } = map_range {
+    send_bb.put_u32(nonce[0]);
+    send_bb.put_u32(nonce[1]);
+    send_bb.put_u32(nonce[2]);
+    send_bb.put_u8(if let MappingRange::Single { protocol, .. } = map_range {
         protocol_to_byte(protocol)
     } else {
         0
     });
-    bb.put(&[0u8; 3][..]); // Reserved.
-    bb.put_u16(
+    send_bb.put(&[0u8; 3][..]); // Reserved.
+    send_bb.put_u16(
         if let MappingRange::Single { internal_port, .. } = map_range {
             internal_port.get()
         } else {
             0
         },
     );
-    bb.put_u16(
+    send_bb.put_u16(
         if let MappingRange::Single {
             suggested_external_port,
             ..
@@ -797,10 +811,10 @@ async fn try_send_map_request(
             0
         },
     );
-    bb.put(&suggested_ip.octets()[..]);
+    send_bb.put(&suggested_ip.octets()[..]);
 
     // Send the request to the gateway.
-    let request = bb.split();
+    let mut recv_bb = &mut recv_buffer[..];
 
     // PCP Requires a random value in [0.9, 1.1] be multiplied by the timeout.
     // <https://www.rfc-editor.org/rfc/rfc6887#section-8.1.1> Expands on PCP timing in detail.
@@ -808,12 +822,19 @@ async fn try_send_map_request(
         .expect("Failed to initialize uniform distribution");
     let fuzz_timeout = |wait: Duration| wait.mul_f64(rand::rng().sample(dist));
 
-    let n =
-        helpers::try_send_until_response(timeout_config, &socket, &request, &mut bb, fuzz_timeout)
-            .await
-            .map_err(Failure::from)?;
+    let n = helpers::try_send_until_response(
+        timeout_config,
+        &socket,
+        &send_buffer[..],
+        &mut recv_bb,
+        fuzz_timeout,
+    )
+    .await
+    .map_err(Failure::from)?;
 
-    Ok(PcpResponse { n, bb })
+    Ok(PcpResponse {
+        bb: &recv_buffer[..n],
+    })
 }
 
 /// Information contained in a valid PCP response header for this version.
@@ -823,13 +844,13 @@ struct ResponseHeader {
     pub gateway_epoch_seconds: u32,
 }
 
-/// Helper to write the common PCP request header.
+/// Helper to write the common PCP request header. Writes 24 bytes (`HEADER_SIZE`) to the given `BufMut`.
 /// Returns the suggested external IP if some, else the zero address, in fixed-length format.
 fn write_base_request(
     op: OperationCode,
     client: IpAddr,
     suggested_external_ip: Option<IpAddr>,
-    bb: &mut bytes::BytesMut,
+    bb: &mut impl BufMut,
     lifetime_seconds: u32,
 ) -> Ipv6Addr {
     // PCP addresses are always specified as 128 bit addresses, <https://www.rfc-editor.org/rfc/rfc6887#section-5>.
@@ -857,21 +878,25 @@ fn write_base_request(
 }
 
 /// Helper function to validate the response from a PCP request. Only validates the first 24 bytes, i.e., the header.
-fn validate_base_response(bb: &mut bytes::BytesMut) -> Result<ResponseHeader, Failure> {
+fn validate_base_response(
+    bb: &mut impl Buf,
+    expected_op: OperationCode,
+) -> Result<ResponseHeader, Failure> {
     // All valid PCP responses have at least 24 bytes, see <https://www.rfc-editor.org/rfc/rfc6887#section-8.3>, page 26.
-    let n = bb.len();
-    if n < 24 {
-        let header_bytes = &bb[..n];
-
+    let n = bb.remaining();
+    if n < HEADER_SIZE {
         // NAT-PMP and PCP response headers are compatible within the first 4 bytes.
         if n >= 4 {
-            let version = header_bytes[0].try_into().map_err(|_| {
-                Failure::InvalidResponse(format!("Unknown version: {:X?}", header_bytes[0]))
-            })?;
+            let version =
+                bb.get_u8()
+                    .try_into()
+                    .map_err(|e: num_enum::TryFromPrimitiveError<_>| {
+                        Failure::InvalidResponse(format!("Unknown version: {:X?}", e.number))
+                    })?;
+            bb.advance(2); // Skip opcode and reserved bytes.
 
             // Check if it matches a PCP unsupported version code.
-            if ResultCode::try_from(header_bytes[3])
-                .is_ok_and(|r| r == ResultCode::UnsupportedVersion)
+            if ResultCode::try_from(bb.get_u8()).is_ok_and(|r| r == ResultCode::UnsupportedVersion)
             {
                 return Err(Failure::UnsupportedVersion(version));
             }
@@ -879,12 +904,12 @@ fn validate_base_response(bb: &mut bytes::BytesMut) -> Result<ResponseHeader, Fa
 
         // The response is too short to be valid.
         return Err(Failure::InvalidResponse(format!(
-            "Too few bytes received: {header_bytes:X?}"
+            "Too few bytes received: {n}, expected at least {HEADER_SIZE}"
         )));
     }
 
     // PCP responses are always a multiple of 4 bytes, see <https://www.rfc-editor.org/rfc/rfc6887#section-8.3>, page 26.
-    if n % 4 != 0 {
+    if !n.is_multiple_of(4) {
         return Err(Failure::InvalidResponse(format!(
             "Invalid response length. Expected a multiple of 4, got: {n}"
         )));
@@ -908,9 +933,9 @@ fn validate_base_response(bb: &mut bytes::BytesMut) -> Result<ResponseHeader, Fa
 
     let op = response_to_opcode(r_opcode_octet)
         .map_err(|op| Failure::InvalidResponse(format!("Invalid operation code: {op:#}")))?;
-    if op != OperationCode::Map {
+    if op != expected_op {
         return Err(Failure::InvalidResponse(format!(
-            "Incorrect opcode: {op:?}"
+            "Incorrect opcode: {op:?}, expected {expected_op:?}"
         )));
     }
     bb.advance(1); // Reserved.
@@ -974,10 +999,10 @@ fn fixed_size_addr(ip: IpAddr) -> Ipv6Addr {
     }
 }
 
-/// Read an `Ipv6Addr` from the given `BytesMut`.
+/// Read an `Ipv6Addr` from the given a `bytes::Buf`.
 /// # Panics
 /// This function panics if there is not enough remaining data in `bb` to read the `Ipv6Addr`.
-fn read_ip6_addr(bb: &mut bytes::BytesMut) -> Ipv6Addr {
+fn read_ip6_addr(bb: &mut impl Buf) -> Ipv6Addr {
     Ipv6Addr::new(
         bb.get_u16(),
         bb.get_u16(),
@@ -991,7 +1016,7 @@ fn read_ip6_addr(bb: &mut bytes::BytesMut) -> Ipv6Addr {
 }
 
 /// Validate a nonce value received.
-fn validate_nonce(bb: &mut bytes::BytesMut, expected_nonce: Nonce) -> Result<(), Failure> {
+fn validate_nonce(bb: &mut impl Buf, expected_nonce: Nonce) -> Result<(), Failure> {
     let response_nonce = [bb.get_u32(), bb.get_u32(), bb.get_u32()];
     if response_nonce != expected_nonce {
         return Err(Failure::Nonce);
@@ -1000,7 +1025,7 @@ fn validate_nonce(bb: &mut bytes::BytesMut, expected_nonce: Nonce) -> Result<(),
 }
 
 /// Validate a port value received.
-fn validate_port(bb: &mut bytes::BytesMut, expected_port: u16) -> Result<(), u16> {
+fn validate_port(bb: &mut impl Buf, expected_port: u16) -> Result<(), u16> {
     let response_port = bb.get_u16();
     if response_port != expected_port {
         return Err(response_port);
@@ -1010,7 +1035,7 @@ fn validate_port(bb: &mut bytes::BytesMut, expected_port: u16) -> Result<(), u16
 
 /// Validate a protocol received.
 fn validate_protocol(
-    bb: &mut bytes::BytesMut,
+    bb: &mut impl Buf,
     expected_protocol: Option<InternetProtocol>,
 ) -> Result<(), Failure> {
     let response_protocol = bb.get_u8();

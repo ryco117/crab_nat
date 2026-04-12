@@ -172,8 +172,7 @@ pub async fn external_address(
     // Read and verify the version and operation bytes.
     let v = VersionCode::try_from(reader.get_u8())
         .map_err(|v| Failure::InvalidResponse(format!("Unknown version: {v:#}")))?;
-    let op = response_to_opcode(reader.get_u8())
-        .map_err(|o| Failure::InvalidResponse(format!("Invalid operation code: {o:#}")))?;
+    let op = response_to_opcode(reader.get_u8())?;
     if op != OperationCode::ExternalAddress {
         return Err(Failure::InvalidResponse(format!(
             "Incorrect opcode: {op:?}"
@@ -362,8 +361,7 @@ async fn port_mapping_internal(
     // Read and verify the version and operation bytes.
     let v = VersionCode::try_from(recv.get_u8())
         .map_err(|v| Failure::InvalidResponse(format!("Unknown version: {v:#}")))?;
-    let op = response_to_opcode(recv.get_u8())
-        .map_err(|o| Failure::InvalidResponse(format!("Invalid operation code: {o:#}")))?;
+    let op = response_to_opcode(recv.get_u8())?;
     if op != req_op {
         return Err(Failure::InvalidResponse(format!(
             "Incorrect opcode: {op:?}"
@@ -406,9 +404,15 @@ async fn port_mapping_internal(
 }
 
 /// Response `OperationCode`s are the same as the request `OperationCode`s, but with the 128 bit set.
-/// This function bit masks the `128` bit from the response code and returns the result.
-fn response_to_opcode(
-    op: u8,
-) -> Result<OperationCode, num_enum::TryFromPrimitiveError<OperationCode>> {
+/// This function verifies the response indicator (R) bit is set, then masks it out and converts to an `OperationCode`.
+/// # Errors
+/// Returns a `Failure::InvalidResponse` if the R bit is not set or the masked opcode is unrecognized.
+fn response_to_opcode(op: u8) -> Result<OperationCode, Failure> {
+    if op & 0x80 == 0 {
+        return Err(Failure::InvalidResponse(format!(
+            "Response R bit (MSb) must be set: {op:08b}"
+        )));
+    }
     OperationCode::try_from(op & 0x7F)
+        .map_err(|o| Failure::InvalidResponse(format!("Invalid operation code: {o:#}")))
 }

@@ -58,7 +58,15 @@ async fn main() {
     };
 
     let local_address = args.local_address.filter(|a| !a.is_empty()).map_or_else(
-        || netdev::interface::get_local_ipaddr().expect("Could not determine a local address"),
+        || {
+            netdev::interface::get_default_interface()
+                .map(|i| {
+                    *i.ip_addrs()
+                        .first()
+                        .expect("No IP addresses found on default interface")
+                })
+                .expect("Could not determine a default network interface")
+        },
         |address| {
             address
                 .parse()

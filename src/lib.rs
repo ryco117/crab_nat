@@ -365,7 +365,7 @@ mod helpers {
     /// Will return a `Socket(..)` error if we:
     /// * Failed to send data on the socket
     /// * Failed to receive data on the socket
-    /// 
+    ///
     /// Otherwise, will return a `Timeout` error if the gateway could not be reached after all retries.
     pub async fn try_send_until_response<B, F>(
         timeout_config: TimeoutConfig,

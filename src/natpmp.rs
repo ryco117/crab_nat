@@ -416,3 +416,6 @@ fn response_to_opcode(op: u8) -> Result<OperationCode, Failure> {
     OperationCode::try_from(op & 0x7F)
         .map_err(|o| Failure::InvalidResponse(format!("Invalid operation code: {o:#}")))
 }
+
+#[cfg(test)]
+mod tests;

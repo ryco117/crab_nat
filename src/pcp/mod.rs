@@ -513,9 +513,10 @@ pub async fn peer_mapping(
     let mut recv_buffer = [0; MAX_DATAGRAM_SIZE];
     let mut recv_bb = &mut recv_buffer[..];
 
-    // PCP Requires a random value in [0.9, 1.1] be multiplied by the timeout.
+    // PCP specifies RT = 2*RTprev + RAND*RTprev where RAND ∈ [-0.1, 0.1].
+    // Since helpers double the duration first, we fuzz by [0.95, 1.05] so the effective range is [1.9, 2.1].
     // <https://www.rfc-editor.org/rfc/rfc6887#section-8.1.1> Expands on PCP timing in detail.
-    let dist = rand::distr::Uniform::try_from(0.9..=1.1)
+    let dist = rand::distr::Uniform::try_from(0.95..=1.05)
         .expect("Failed to initialize uniform distribution");
     let fuzz_timeout = |wait: Duration| wait.mul_f64(rand::rng().sample(dist));
 
@@ -816,9 +817,10 @@ async fn try_send_map_request(
     // Send the request to the gateway.
     let mut recv_bb = &mut recv_buffer[..];
 
-    // PCP Requires a random value in [0.9, 1.1] be multiplied by the timeout.
+    // PCP specifies RT = 2*RTprev + RAND*RTprev where RAND ∈ [-0.1, 0.1].
+    // Since helpers double the duration first, we fuzz by [0.95, 1.05] so the effective range is [1.9, 2.1].
     // <https://www.rfc-editor.org/rfc/rfc6887#section-8.1.1> Expands on PCP timing in detail.
-    let dist = rand::distr::Uniform::try_from(0.9..=1.1)
+    let dist = rand::distr::Uniform::try_from(0.95..=1.05)
         .expect("Failed to initialize uniform distribution");
     let fuzz_timeout = |wait: Duration| wait.mul_f64(rand::rng().sample(dist));
 
@@ -919,9 +921,7 @@ fn validate_base_response(
     let v = VersionCode::try_from(bb.get_u8())
         .map_err(|v| Failure::InvalidResponse(format!("Unknown version: {v:#}")))?;
     if v != VersionCode::Pcp {
-        return Err(Failure::InvalidResponse(format!(
-            "Unsupported version: {v:?}"
-        )));
+        return Err(Failure::UnsupportedVersion(v));
     }
 
     let r_opcode_octet = bb.get_u8();

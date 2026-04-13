@@ -15,8 +15,9 @@ fn test_response_to_opcode_valid() {
 #[test]
 fn test_response_to_opcode_r_bit_unset() {
     let err = response_to_opcode(0x01).unwrap_err();
-    assert!(matches!(err, Failure::InvalidResponse(ref msg)
-        if msg.contains("Response R bit (MSb) must be set")
+    assert!(matches!(
+        err,
+        Failure::InvalidResponse(InvalidResponseKind::ResponseBitNotSet(0x01))
     ));
 }
 
@@ -24,8 +25,9 @@ fn test_response_to_opcode_r_bit_unset() {
 #[test]
 fn test_response_to_opcode_invalid_opcode() {
     let err = response_to_opcode(0xFF).unwrap_err();
-    assert!(matches!(err, Failure::InvalidResponse(ref msg)
-        if msg.contains("Invalid operation code")
+    assert!(matches!(
+        err,
+        Failure::InvalidResponse(InvalidResponseKind::InvalidOperationCode(0x7F))
     ));
 }
 

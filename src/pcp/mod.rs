@@ -99,6 +99,68 @@ pub enum OperationCode {
     Peer,
 }
 
+/// Specific reasons why a PCP response was considered invalid.
+#[derive(Debug, thiserror::Error)]
+pub enum InvalidResponseKind {
+    /// The response had too few bytes.
+    #[error("Too few bytes received: {received}, expected at least {expected}")]
+    TooFewBytes { received: usize, expected: usize },
+
+    /// The response length is not a valid multiple of 4.
+    #[error("Invalid response length. Expected a multiple of 4, got: {0}")]
+    ResponseNotMultipleOfFour(usize),
+
+    /// The version byte is not a recognized version code.
+    #[error("Unknown version: {0:#X}")]
+    UnknownVersion(u8),
+
+    /// The response R bit (most significant bit) was not set on the opcode byte.
+    #[error("Response R bit (MSb) must be set: {0:08b}")]
+    ResponseBitNotSet(u8),
+
+    /// The operation code (after masking R bit) is not a recognized operation.
+    #[error("Invalid operation code: {0:#X}")]
+    InvalidOperationCode(u8),
+
+    /// The response opcode doesn't match the expected opcode.
+    #[error("Incorrect opcode: {received:?}, expected {expected:?}")]
+    IncorrectOpcode {
+        received: OperationCode,
+        expected: OperationCode,
+    },
+
+    /// The result code is not a recognized result code.
+    #[error("Invalid result code: {0:#X}")]
+    InvalidResultCode(u8),
+
+    /// The protocol in the response doesn't match the expected protocol.
+    #[error("Incorrect protocol: {received}, expected {expected:?}")]
+    IncorrectProtocol {
+        received: u8,
+        expected: Option<InternetProtocol>,
+    },
+
+    /// The internal port in the response doesn't match the request.
+    #[error("Incorrect internal port: {received}, expected {expected}")]
+    IncorrectInternalPort { received: u16, expected: u16 },
+
+    /// The remote port in the response doesn't match the request.
+    #[error("Incorrect remote port: {received}, expected {expected}")]
+    IncorrectRemotePort { received: u16, expected: u16 },
+
+    /// The remote IP address in the response doesn't match the request.
+    #[error("Incorrect remote IP: {received}, expected {expected}")]
+    IncorrectRemoteIp { received: IpAddr, expected: IpAddr },
+
+    /// The external port was zero (invalid for a mapping response).
+    #[error("Received external port of 0")]
+    ZeroExternalPort,
+
+    /// A deletion response had a non-zero lifetime.
+    #[error("Invalid response to deletion request: {lifetime_seconds}")]
+    InvalidDeletionResponse { lifetime_seconds: u32 },
+}
+
 /// Errors that may occur when trying to map a port on the gateway, categorized by the root of the issue.
 #[derive(Debug, thiserror::Error)]
 pub enum Failure {
@@ -114,9 +176,9 @@ pub enum Failure {
     #[error("Incorrect nonce received from the gateway")]
     Nonce,
 
-    /// The gateway did not give a valid response according to the NAT-PMP protocol.
+    /// The gateway did not give a valid response according to the PCP protocol.
     #[error("Invalid response: {0}")]
-    InvalidResponse(String),
+    InvalidResponse(InvalidResponseKind),
 
     /// The gateway gave a version-mismatch response with a closest supported version.
     #[error("Server responded with code: Unsupported version: Closest supported version: {0}")]
@@ -248,8 +310,9 @@ pub async fn port_mapping(
     .await?;
 
     // Ensure the external port is not zero.
-    let external_port = NonZeroU16::new(external_port)
-        .ok_or_else(|| Failure::InvalidResponse("Invalid external port of zero".to_owned()))?;
+    let external_port = NonZeroU16::new(external_port).ok_or(Failure::InvalidResponse(
+        InvalidResponseKind::ZeroExternalPort,
+    ))?;
 
     Ok(PortMapping {
         gateway: base.gateway,
@@ -407,9 +470,9 @@ pub async fn try_drop_mapping(
 
     // Check that the response is correct for a deletion request.
     if lifetime_seconds != 0 {
-        return Err(Failure::InvalidResponse(format!(
-            "Invalid response to deletion request: {lifetime_seconds}"
-        )));
+        return Err(Failure::InvalidResponse(
+            InvalidResponseKind::InvalidDeletionResponse { lifetime_seconds },
+        ));
     }
 
     Ok(())
@@ -539,9 +602,10 @@ pub async fn peer_mapping(
 
     // Ensure we can read the rest of the peer response.
     if n < 80 {
-        return Err(Failure::InvalidResponse(format!(
-            "Too few bytes received: {n}, expected at least 80"
-        )));
+        return Err(Failure::InvalidResponse(InvalidResponseKind::TooFewBytes {
+            received: n,
+            expected: 80,
+        }));
     }
 
     // Validate the nonce.
@@ -555,14 +619,16 @@ pub async fn peer_mapping(
     // Validate the internal port.
     let internal_port = base.internal_port;
     validate_port(&mut recv_bb, internal_port.get()).map_err(|r| {
-        Failure::InvalidResponse(format!(
-            "Incorrect internal port {r}, expected {internal_port}"
-        ))
+        Failure::InvalidResponse(InvalidResponseKind::IncorrectInternalPort {
+            received: r,
+            expected: internal_port.get(),
+        })
     })?;
 
     // The external port assigned to our mapping. The server may not use the requested port, if present.
-    let external_port = NonZeroU16::new(recv_bb.get_u16())
-        .ok_or_else(|| Failure::InvalidResponse("Received external port of 0".to_owned()))?;
+    let external_port = NonZeroU16::new(recv_bb.get_u16()).ok_or(Failure::InvalidResponse(
+        InvalidResponseKind::ZeroExternalPort,
+    ))?;
 
     // The external IP address assigned to our mapping.
     let external_ip = read_ip6_addr(&mut recv_bb);
@@ -574,7 +640,10 @@ pub async fn peer_mapping(
 
     // Validate the remote port.
     validate_port(&mut recv_bb, remote_port).map_err(|r| {
-        Failure::InvalidResponse(format!("Incorrect remote port {r}, expected {remote_port}"))
+        Failure::InvalidResponse(InvalidResponseKind::IncorrectRemotePort {
+            received: r,
+            expected: remote_port,
+        })
     })?;
 
     recv_bb.advance(2); // Reserved.
@@ -587,9 +656,12 @@ pub async fn peer_mapping(
         IpAddr::V6(response_remote_ip)
     };
     if response_remote_ip != remote_ip {
-        return Err(Failure::InvalidResponse(format!(
-            "Incorrect remote IP {response_remote_ip}, expected {remote_ip}"
-        )));
+        return Err(Failure::InvalidResponse(
+            InvalidResponseKind::IncorrectRemoteIp {
+                received: response_remote_ip,
+                expected: remote_ip,
+            },
+        ));
     }
 
     Ok(PeerMapping {
@@ -681,9 +753,10 @@ async fn port_mapping_internal(
 
     // Ensure we can read the rest of the map response.
     if n < 60 {
-        return Err(Failure::InvalidResponse(format!(
-            "Too few bytes received: {n}, expected at least 60"
-        )));
+        return Err(Failure::InvalidResponse(InvalidResponseKind::TooFewBytes {
+            received: n,
+            expected: 60,
+        }));
     }
 
     // Validate the mapping response values.
@@ -702,9 +775,10 @@ async fn port_mapping_internal(
         0
     };
     validate_port(&mut bb, expected_internal_port).map_err(|r| {
-        Failure::InvalidResponse(format!(
-            "Incorrect internal port {r}, expected {expected_internal_port}"
-        ))
+        Failure::InvalidResponse(InvalidResponseKind::IncorrectInternalPort {
+            received: r,
+            expected: expected_internal_port,
+        })
     })?;
 
     // The external port assigned to our mapping. The server may not use the suggested port, if present.
@@ -897,7 +971,7 @@ fn validate_base_response(
                 bb.get_u8()
                     .try_into()
                     .map_err(|e: num_enum::TryFromPrimitiveError<_>| {
-                        Failure::InvalidResponse(format!("Unknown version: {:X?}", e.number))
+                        Failure::InvalidResponse(InvalidResponseKind::UnknownVersion(e.number))
                     })?;
             bb.advance(2); // Skip opcode and reserved bytes.
 
@@ -909,42 +983,47 @@ fn validate_base_response(
         }
 
         // The response is too short to be valid.
-        return Err(Failure::InvalidResponse(format!(
-            "Too few bytes received: {n}, expected at least {HEADER_SIZE}"
-        )));
+        return Err(Failure::InvalidResponse(InvalidResponseKind::TooFewBytes {
+            received: n,
+            expected: HEADER_SIZE,
+        }));
     }
 
     // PCP responses are always a multiple of 4 bytes, see <https://www.rfc-editor.org/rfc/rfc6887#section-8.3>, page 26.
     if !n.is_multiple_of(4) {
-        return Err(Failure::InvalidResponse(format!(
-            "Invalid response length. Expected a multiple of 4, got: {n}"
-        )));
+        return Err(Failure::InvalidResponse(
+            InvalidResponseKind::ResponseNotMultipleOfFour(n),
+        ));
     }
 
     // Parse the PCP response header.
     let v = VersionCode::try_from(bb.get_u8())
-        .map_err(|v| Failure::InvalidResponse(format!("Unknown version: {v:#}")))?;
+        .map_err(|e| Failure::InvalidResponse(InvalidResponseKind::UnknownVersion(e.number)))?;
     if v != VersionCode::Pcp {
         return Err(Failure::UnsupportedVersion(v));
     }
 
     let r_opcode_octet = bb.get_u8();
     if r_opcode_octet & 0x80 == 0 {
-        return Err(Failure::InvalidResponse(format!(
-            "Response R bit (MSb) must be set: {r_opcode_octet:08b}"
-        )));
+        return Err(Failure::InvalidResponse(
+            InvalidResponseKind::ResponseBitNotSet(r_opcode_octet),
+        ));
     }
 
-    let op = response_to_opcode(r_opcode_octet)
-        .map_err(|op| Failure::InvalidResponse(format!("Invalid operation code: {op:#}")))?;
+    let op = response_to_opcode(r_opcode_octet).map_err(|e| {
+        Failure::InvalidResponse(InvalidResponseKind::InvalidOperationCode(e.number))
+    })?;
     if op != expected_op {
-        return Err(Failure::InvalidResponse(format!(
-            "Incorrect opcode: {op:?}, expected {expected_op:?}"
-        )));
+        return Err(Failure::InvalidResponse(
+            InvalidResponseKind::IncorrectOpcode {
+                received: op,
+                expected: expected_op,
+            },
+        ));
     }
     bb.advance(1); // Reserved.
     let result_code = ResultCode::try_from(bb.get_u8())
-        .map_err(|r| Failure::InvalidResponse(format!("Invalid result code: {r:#}")))?;
+        .map_err(|e| Failure::InvalidResponse(InvalidResponseKind::InvalidResultCode(e.number)))?;
 
     // On error, lifetime indicates the number of seconds until the error is expected to be resolved.
     // See <https://www.rfc-editor.org/rfc/rfc6887#section-8.3>, page 26.
@@ -1044,9 +1123,12 @@ fn validate_protocol(
 ) -> Result<(), Failure> {
     let response_protocol = bb.get_u8();
     if response_protocol != expected_protocol.map_or(0, protocol_to_byte) {
-        return Err(Failure::InvalidResponse(format!(
-            "Incorrect protocol {response_protocol}, expected {expected_protocol:?}"
-        )));
+        return Err(Failure::InvalidResponse(
+            InvalidResponseKind::IncorrectProtocol {
+                received: response_protocol,
+                expected: expected_protocol,
+            },
+        ));
     }
     Ok(())
 }

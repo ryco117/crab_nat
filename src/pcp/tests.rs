@@ -7,8 +7,12 @@ fn test_validate_base_response_too_short() {
     // Less than 24 bytes should return InvalidResponse
     let mut bb = BytesMut::from(&[0u8; 16][..]);
     let err = validate_base_response(&mut bb, OperationCode::Map).unwrap_err();
-    assert!(matches!( err, Failure::InvalidResponse(ref msg)
-        if msg.contains("Too few bytes")
+    assert!(matches!(
+        err,
+        Failure::InvalidResponse(InvalidResponseKind::TooFewBytes {
+            received: 16,
+            expected: HEADER_SIZE
+        })
     ));
 }
 
@@ -17,8 +21,9 @@ fn test_validate_base_response_invalid_length() {
     // More than 24 bytes but not a multiple of 4 bytes should return InvalidResponse
     let mut bb = BytesMut::from(&[0u8; 27][..]);
     let err = validate_base_response(&mut bb, OperationCode::Map).unwrap_err();
-    assert!(matches!( err, Failure::InvalidResponse(ref msg)
-        if msg.contains("Invalid response length")
+    assert!(matches!(
+        err,
+        Failure::InvalidResponse(InvalidResponseKind::ResponseNotMultipleOfFour(27))
     ));
 }
 
@@ -29,8 +34,9 @@ fn test_validate_base_response_unsupported_version() {
     bb.put_u8(0xFF); // version (invalid)
     bb.put_bytes(0u8, 23); // rest of header unchecked
     let err = validate_base_response(&mut bb, OperationCode::Map).unwrap_err();
-    assert!(matches!(err, Failure::InvalidResponse(ref msg)
-        if msg.contains("Unknown version")
+    assert!(matches!(
+        err,
+        Failure::InvalidResponse(InvalidResponseKind::UnknownVersion(0xFF))
     ));
 }
 
@@ -42,8 +48,9 @@ fn test_validate_base_response_unset_r_bit() {
     bb.put_u8(0x01); // opcode with R MSb unset
     bb.put_bytes(0, 22); // rest of header unchecked
     let err = validate_base_response(&mut bb, OperationCode::Map).unwrap_err();
-    assert!(matches!(err, Failure::InvalidResponse(ref msg)
-        if msg.contains("Response R bit (MSb) must be set")
+    assert!(matches!(
+        err,
+        Failure::InvalidResponse(InvalidResponseKind::ResponseBitNotSet(0x01))
     ));
 }
 
@@ -165,8 +172,12 @@ fn test_validate_base_response_wrong_opcode() {
     bb.put_u32(20);
     bb.put_bytes(0, 12);
     let err = validate_base_response(&mut bb, OperationCode::Map).unwrap_err();
-    assert!(matches!(err, Failure::InvalidResponse(ref msg)
-        if msg.contains("Incorrect opcode")
+    assert!(matches!(
+        err,
+        Failure::InvalidResponse(InvalidResponseKind::IncorrectOpcode {
+            received: OperationCode::Peer,
+            expected: OperationCode::Map
+        })
     ));
 }
 
@@ -275,8 +286,12 @@ fn test_validate_protocol_mismatch() {
     buf.put_u8(17); // UDP
     let mut reader = &buf[..];
     let err = validate_protocol(&mut reader, Some(InternetProtocol::Tcp)).unwrap_err();
-    assert!(matches!(err, Failure::InvalidResponse(ref msg)
-        if msg.contains("Incorrect protocol")
+    assert!(matches!(
+        err,
+        Failure::InvalidResponse(InvalidResponseKind::IncorrectProtocol {
+            received: 17,
+            expected: Some(InternetProtocol::Tcp)
+        })
     ));
 }
 

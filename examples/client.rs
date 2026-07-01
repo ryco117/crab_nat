@@ -120,7 +120,7 @@ async fn main() {
 
     // If the delete all flag is set, attempt to delete all mappings for the protocol and exit.
     if args.delete_all {
-        crab_nat::natpmp::try_drop_mapping(gateway, protocol, None, None)
+        crab_nat::natpmp::try_drop_mapping(gateway, protocol, None, None, None)
             .await
             .unwrap_or_else(|e| {
                 tracing::error!("Failed to delete mappings: {e:#}");
@@ -131,7 +131,7 @@ async fn main() {
 
     // If the external IP flag is set, attempt to get the external IP and exit.
     if args.external_ip {
-        let external_ip = match crab_nat::natpmp::external_address(gateway, None).await {
+        let external_ip = match crab_nat::natpmp::external_address(gateway, None, None).await {
             Ok(ip) => ip,
             Err(e) => return tracing::error!("Failed to get external IP: {e:#}"),
         };

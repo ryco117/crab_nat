@@ -182,12 +182,13 @@ pub fn code_to_result(result_code: ResultCode, v: VersionCode) -> Result<(), Fai
 pub async fn external_address(
     gateway: IpAddr,
     timeout_config: Option<TimeoutConfig>,
+    scope_id: Option<u32>,
 ) -> Result<Ipv4Addr, Failure> {
     /// External address responses have datagrams of size 12 bytes, see <https://www.rfc-editor.org/rfc/rfc6886#section-3.2>.
     const ADDRESS_RESPONSE_SIZE: usize = 12;
 
     // Create a new UDP socket and connect to the gateway.
-    let socket = helpers::new_socket(gateway)
+    let socket = helpers::new_socket(gateway, scope_id)
         .await
         .map_err(Failure::Socket)?;
 
@@ -275,6 +276,7 @@ pub async fn port_mapping(
 
     Ok(PortMapping {
         gateway,
+        gateway_scope_id: mapping_options.gateway_scope_id,
         protocol,
         internal_port,
         external_port,
@@ -295,6 +297,7 @@ pub async fn try_drop_mapping(
     protocol: InternetProtocol,
     local_port: Option<NonZeroU16>,
     timeout_config: Option<TimeoutConfig>,
+    scope_id: Option<u32>,
 ) -> Result<(), Failure> {
     // Mapping deletion is specified by the same operation code and format as mapping creation.
     // The difference is that the lifetime and external port must be set to `0` and an internal port of `0` will remove all mappings for the protocol.
@@ -310,6 +313,7 @@ pub async fn try_drop_mapping(
             external_port: None,
             lifetime_seconds: Some(0),
             timeout_config,
+            gateway_scope_id: scope_id,
         },
     )
     .await?;
@@ -357,7 +361,7 @@ async fn port_mapping_internal(
         "Internal port can only be `0` for a valid 'delete all' request."
     );
 
-    let socket = helpers::new_socket(gateway)
+    let socket = helpers::new_socket(gateway, mapping_options.gateway_scope_id)
         .await
         .map_err(Failure::Socket)?;
 

@@ -1,16 +1,12 @@
-use std::{
-    net::{IpAddr, Ipv4Addr},
-    num::NonZeroU16,
-    time::Duration,
-};
+use std::{net::Ipv4Addr, num::NonZeroU16, time::Duration};
 
 use bytes::{Buf, BufMut};
 use num_enum::TryFromPrimitive;
 
 use crate::{
     helpers::{self, RequestSendError},
-    InternetProtocol, PortMapping, PortMappingOptions, PortMappingType, TimeoutConfig, VersionCode,
-    RECOMMENDED_MAPPING_LIFETIME_SECONDS, SANE_MAX_REQUEST_RETRIES,
+    GatewayAddress, InternetProtocol, PortMapping, PortMappingOptions, PortMappingType,
+    TimeoutConfig, VersionCode, RECOMMENDED_MAPPING_LIFETIME_SECONDS, SANE_MAX_REQUEST_RETRIES,
 };
 
 /// The RFC states that the first response timeout SHOULD be 250 milliseconds, and double on each successive failure.
@@ -180,15 +176,14 @@ pub fn code_to_result(result_code: ResultCode, v: VersionCode) -> Result<(), Fai
 /// # Errors
 /// Returns a `natpmp::Failure` enum which decomposes into different errors depending on the cause.
 pub async fn external_address(
-    gateway: IpAddr,
+    gateway: GatewayAddress,
     timeout_config: Option<TimeoutConfig>,
-    scope_id: Option<u32>,
 ) -> Result<Ipv4Addr, Failure> {
     /// External address responses have datagrams of size 12 bytes, see <https://www.rfc-editor.org/rfc/rfc6886#section-3.2>.
     const ADDRESS_RESPONSE_SIZE: usize = 12;
 
     // Create a new UDP socket and connect to the gateway.
-    let socket = helpers::new_socket(gateway, scope_id)
+    let socket = helpers::new_socket(gateway)
         .await
         .map_err(Failure::Socket)?;
 
@@ -259,7 +254,7 @@ pub async fn external_address(
 /// # Errors
 /// Returns a `natpmp::Failure` enum which decomposes into different errors depending on the cause.
 pub async fn port_mapping(
-    gateway: IpAddr,
+    gateway: GatewayAddress,
     protocol: InternetProtocol,
     internal_port: NonZeroU16,
     mapping_options: PortMappingOptions,
@@ -276,7 +271,6 @@ pub async fn port_mapping(
 
     Ok(PortMapping {
         gateway,
-        gateway_scope_id: mapping_options.gateway_scope_id,
         protocol,
         internal_port,
         external_port,
@@ -293,11 +287,10 @@ pub async fn port_mapping(
 /// # Errors
 /// Returns a `natpmp::Failure` enum which decomposes into different errors depending on the cause.
 pub async fn try_drop_mapping(
-    gateway: IpAddr,
+    gateway: GatewayAddress,
     protocol: InternetProtocol,
     local_port: Option<NonZeroU16>,
     timeout_config: Option<TimeoutConfig>,
-    scope_id: Option<u32>,
 ) -> Result<(), Failure> {
     // Mapping deletion is specified by the same operation code and format as mapping creation.
     // The difference is that the lifetime and external port must be set to `0` and an internal port of `0` will remove all mappings for the protocol.
@@ -313,7 +306,6 @@ pub async fn try_drop_mapping(
             external_port: None,
             lifetime_seconds: Some(0),
             timeout_config,
-            gateway_scope_id: scope_id,
         },
     )
     .await?;
@@ -346,7 +338,7 @@ struct PortMappingInternal {
 /// Panics if `internal_port` is `0` but does not have a valid "delete all" request.
 /// I.e., the `mapping_options.lifetime_seconds` must be `Some(0)` and the `mapping_options.external_port` must be `None`.
 async fn port_mapping_internal(
-    gateway: IpAddr,
+    gateway: GatewayAddress,
     protocol: InternetProtocol,
     internal_port: u16,
     mapping_options: PortMappingOptions,
@@ -361,7 +353,7 @@ async fn port_mapping_internal(
         "Internal port can only be `0` for a valid 'delete all' request."
     );
 
-    let socket = helpers::new_socket(gateway, mapping_options.gateway_scope_id)
+    let socket = helpers::new_socket(gateway)
         .await
         .map_err(Failure::Socket)?;
 

@@ -105,6 +105,32 @@ pub enum PortMappingType {
     },
 }
 
+/// Specifies the address of the gateway, either IPv4 or IPv6.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum GatewayAddress {
+    /// IPv4 address of the gateway.
+    IpV4(std::net::Ipv4Addr),
+
+    /// IPv6 address of the gateway, with an optional scope (zone) id for link-local addresses.
+    IpV6(std::net::Ipv6Addr, Option<u32>),
+}
+impl From<GatewayAddress> for IpAddr {
+    fn from(gateway: GatewayAddress) -> Self {
+        match gateway {
+            GatewayAddress::IpV4(v4) => IpAddr::V4(v4),
+            GatewayAddress::IpV6(v6, _) => IpAddr::V6(v6),
+        }
+    }
+}
+impl From<IpAddr> for GatewayAddress {
+    fn from(ip: IpAddr) -> Self {
+        match ip {
+            IpAddr::V4(v4) => GatewayAddress::IpV4(v4),
+            IpAddr::V6(v6) => GatewayAddress::IpV6(v6, None),
+        }
+    }
+}
+
 /// Configuration of the timing of UDP requests to the gateway.
 #[derive(Clone, Copy, Debug)]
 pub struct TimeoutConfig {
@@ -130,23 +156,13 @@ pub struct PortMappingOptions {
 
     /// The configuration of the timing of UDP requests made to the gateway.
     pub timeout_config: Option<TimeoutConfig>,
-
-    /// The IPv6 scope (zone) id of the interface toward the gateway, used
-    /// when the gateway is a link-local (`fe80::`) address — a link-local
-    /// destination cannot be connected without a zone. `None` (the default)
-    /// or a non-link-local gateway leaves the zone unset. Ignored for IPv4.
-    pub gateway_scope_id: Option<u32>,
 }
 
 /// A port mapping on the gateway. Should be renewed with `.renew()` and deleted from the gateway with `.try_drop()`.
 #[derive(Clone, Debug)]
 pub struct PortMapping {
     /// The address of the gateway the mapping is registered with.
-    gateway: IpAddr,
-
-    /// The IPv6 scope (zone) id toward the gateway, carried so renew/drop can
-    /// reconnect to a link-local gateway. `None` for IPv4 or a non-link-local gateway.
-    gateway_scope_id: Option<u32>,
+    gateway: GatewayAddress,
 
     /// The protocol the mapping is for.
     protocol: InternetProtocol,
@@ -182,7 +198,7 @@ impl PortMapping {
     /// If a different `Pcp(_)` error is returned, then *NAT-PMP is likely not supported* by the gateway and this call will not attempt it.
     /// If you want to still attempt NAT-PMP after PCP fails, you can call `natpmp::port_mapping(..)` directly.
     pub async fn new(
-        gateway: IpAddr,
+        gateway: GatewayAddress,
         client: IpAddr,
         protocol: InternetProtocol,
         internal_port: NonZeroU16,
@@ -223,7 +239,6 @@ impl PortMapping {
             external_port: Some(self.external_port),
             lifetime_seconds: Some(self.lifetime()),
             timeout_config: Some(self.timeout_config),
-            gateway_scope_id: self.gateway_scope_id,
         };
 
         // Attempt to renew the existing port mapping on the gateway.
@@ -274,7 +289,6 @@ impl PortMapping {
                 self.protocol(),
                 Some(internal_port),
                 Some(self.timeout_config),
-                self.gateway_scope_id(),
             )
             .await
             .map_err(|e| (MappingFailure::from(e), self)),
@@ -288,22 +302,26 @@ impl PortMapping {
                     protocol,
                 },
                 Some(self.timeout_config),
-                self.gateway_scope_id(),
             )
             .await
             .map_err(|e| (MappingFailure::from(e), self)),
         }
     }
 
-    /// The address of the gateway the mapping is registered with.
+    /// The address of the gateway the mapping is registered with, along with an optional IPv6 scope (zone) id.
     #[must_use]
-    pub fn gateway(&self) -> IpAddr {
+    pub fn gateway(&self) -> GatewayAddress {
         self.gateway
     }
     /// The IPv6 scope (zone) id toward the gateway, if the gateway is link-local.
+    /// Only returns `Some(scope_id)` if the gateway address is IPv6 and a scope ID was provided, otherwise `None`.
     #[must_use]
     pub fn gateway_scope_id(&self) -> Option<u32> {
-        self.gateway_scope_id
+        if let GatewayAddress::IpV6(_, scope_id) = self.gateway {
+            scope_id
+        } else {
+            None
+        }
     }
     /// The protocol the mapping is for.
     #[must_use]
@@ -344,32 +362,29 @@ impl PortMapping {
 
 /// Private module for shared helper functions within the library.
 mod helpers {
-    use std::{net::IpAddr, time::Duration};
-
+    use crate::{GatewayAddress, TimeoutConfig};
+    use std::time::Duration;
     use tokio::net::UdpSocket;
 
-    use crate::TimeoutConfig;
-
-    /// Create a new UDP socket and connect it to the gateway socket address for NAT-PMP or PCP.
-    /// `scope_id` sets the IPv6 zone on the connect destination, required to reach a link-local
-    /// (`fe80::`) gateway; it is ignored for IPv4 and for non-link-local gateways.
+    /// Create a new UDP socket and "connect" it to the gateway socket address for NAT-PMP or PCP.
     /// # Errors
     /// Will return an error if we fail to bind to a local UDP socket or connect to the gateway address.
     pub async fn new_socket(
-        gateway: IpAddr,
-        scope_id: Option<u32>,
+        gateway: GatewayAddress,
     ) -> Result<tokio::net::UdpSocket, std::io::Error> {
         use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
         // Create a new UDP with an IP protocol matching that of the gateway address.
         let socket = tokio::net::UdpSocket::bind(match &gateway {
-            IpAddr::V4(_) => SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)),
-            IpAddr::V6(_) => SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0)),
+            GatewayAddress::IpV4(_) => SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)),
+            GatewayAddress::IpV6(_, _) => {
+                SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0))
+            }
         })
         .await?;
         let destination = match gateway {
-            IpAddr::V4(v4) => SocketAddr::V4(SocketAddrV4::new(v4, crate::GATEWAY_PORT)),
-            IpAddr::V6(v6) => SocketAddr::V6(SocketAddrV6::new(
+            GatewayAddress::IpV4(v4) => SocketAddr::V4(SocketAddrV4::new(v4, crate::GATEWAY_PORT)),
+            GatewayAddress::IpV6(v6, scope_id) => SocketAddr::V6(SocketAddrV6::new(
                 v6,
                 crate::GATEWAY_PORT,
                 0,

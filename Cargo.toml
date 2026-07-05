@@ -1,6 +1,6 @@
 [package]
 name = "crab_nat"
-version = "0.7.6"
+version = "0.8.0"
 edition = "2021"
 authors = ["Ryan Andersen <ryco117@gmail.com>"]
 description = "A library providing a pure Rust implementation of a client for both the NAT Port Mapping Protocol (NAT-PMP) and the Port Control Protocol (PCP)."
@@ -8,17 +8,17 @@ license = "MIT"
 repository = "https://github.com/ryco117/crab_nat"
 
 [dependencies]
-bytes = "1.11.1"
+bytes = "1.12.0"
 displaydoc = "0.2.6"
 num_enum = "0.7.6"
-rand = "0.10.1"
+rand = "0.10.2"
 thiserror = "2.0.18"
 tokio = { version = "1.52.3", features = ["io-util", "net", "time"] }
 tracing = { version = "0.1.44", optional = true }
 
 [dev-dependencies]
 clap = { version = "4.6.1", features = ["derive"] }
-netdev = "0.44.0"
+netdev = "0.45.0"
 tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread", "signal"] }
 tracing-subscriber = "0.3.23"
 

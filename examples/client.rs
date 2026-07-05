@@ -76,51 +76,55 @@ async fn main() {
     tracing::info!("Using local address: {local_address}");
 
     // Get the gateway address from the command line or guess the default.
-    let gateway = args.gateway.filter(|g| !g.is_empty()).map_or_else(
-        || {
-            // Attempt to get a sensible default gateway.
-            let gateway = netdev::get_default_gateway().expect("Could not determine a gateway");
+    let gateway = args
+        .gateway
+        .filter(|g| !g.is_empty())
+        .map_or_else(
+            || {
+                // Attempt to get a sensible default gateway.
+                let gateway = netdev::get_default_gateway().expect("Could not determine a gateway");
 
-            // Attempt to get a gateway address matching the IP version of the local address.
-            if local_address.is_ipv4() {
+                // Attempt to get a gateway address matching the IP version of the local address.
+                if local_address.is_ipv4() {
+                    gateway
+                        .ipv4
+                        .first()
+                        .map(|ip| IpAddr::V4(*ip))
+                        .unwrap_or_else(|| {
+                            IpAddr::V6(
+                                *gateway
+                                    .ipv6
+                                    .first()
+                                    .expect("No addresses found for default gateway"),
+                            )
+                        })
+                } else {
+                    gateway
+                        .ipv6
+                        .first()
+                        .map(|ip| IpAddr::V6(*ip))
+                        .unwrap_or_else(|| {
+                            IpAddr::V4(
+                                *gateway
+                                    .ipv4
+                                    .first()
+                                    .expect("No addresses found for default gateway"),
+                            )
+                        })
+                }
+            },
+            |gateway| {
                 gateway
-                    .ipv4
-                    .first()
-                    .map(|ip| IpAddr::V4(*ip))
-                    .unwrap_or_else(|| {
-                        IpAddr::V6(
-                            *gateway
-                                .ipv6
-                                .first()
-                                .expect("No addresses found for default gateway"),
-                        )
-                    })
-            } else {
-                gateway
-                    .ipv6
-                    .first()
-                    .map(|ip| IpAddr::V6(*ip))
-                    .unwrap_or_else(|| {
-                        IpAddr::V4(
-                            *gateway
-                                .ipv4
-                                .first()
-                                .expect("No addresses found for default gateway"),
-                        )
-                    })
-            }
-        },
-        |gateway| {
-            gateway
-                .parse()
-                .expect("Invalid gateway, must be an IP address")
-        },
-    );
-    tracing::info!("Using gateway address: {gateway}");
+                    .parse()
+                    .expect("Invalid gateway, must be an IP address")
+            },
+        )
+        .into();
+    tracing::info!("Using gateway address: {gateway:?}");
 
     // If the delete all flag is set, attempt to delete all mappings for the protocol and exit.
     if args.delete_all {
-        crab_nat::natpmp::try_drop_mapping(gateway, protocol, None, None, None)
+        crab_nat::natpmp::try_drop_mapping(gateway, protocol, None, None)
             .await
             .unwrap_or_else(|e| {
                 tracing::error!("Failed to delete mappings: {e:#}");
@@ -131,7 +135,7 @@ async fn main() {
 
     // If the external IP flag is set, attempt to get the external IP and exit.
     if args.external_ip {
-        let external_ip = match crab_nat::natpmp::external_address(gateway, None, None).await {
+        let external_ip = match crab_nat::natpmp::external_address(gateway, None).await {
             Ok(ip) => ip,
             Err(e) => return tracing::error!("Failed to get external IP: {e:#}"),
         };
@@ -197,7 +201,7 @@ async fn main() {
         // Try to safely drop the mapping.
         if let Err((e, m)) = mapping.try_drop().await {
             tracing::error!(
-                "Failed to drop mapping {protocol} {gateway}:{}->{}: {e:#}",
+                "Failed to drop mapping {protocol} {gateway:?}:{}->{}: {e:#}",
                 m.external_port(),
                 m.internal_port()
             );

@@ -369,9 +369,12 @@ mod helpers {
         .await?;
         let destination = match gateway {
             IpAddr::V4(v4) => SocketAddr::V4(SocketAddrV4::new(v4, crate::GATEWAY_PORT)),
-            IpAddr::V6(v6) => {
-                SocketAddr::V6(SocketAddrV6::new(v6, crate::GATEWAY_PORT, 0, scope_id.unwrap_or(0)))
-            }
+            IpAddr::V6(v6) => SocketAddr::V6(SocketAddrV6::new(
+                v6,
+                crate::GATEWAY_PORT,
+                0,
+                scope_id.unwrap_or(0),
+            )),
         };
         socket.connect(destination).await?;
 

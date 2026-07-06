@@ -178,7 +178,7 @@ pub enum Failure {
 
     /// The gateway did not give a valid response according to the PCP protocol.
     #[error("Invalid response: {0}")]
-    InvalidResponse(InvalidResponseKind),
+    InvalidResponse(#[from] InvalidResponseKind),
 
     /// The gateway gave a version-mismatch response with a closest supported version.
     #[error("Server responded with code: Unsupported version: Closest supported version: {0}")]
@@ -310,9 +310,8 @@ pub async fn port_mapping(
     .await?;
 
     // Ensure the external port is not zero.
-    let external_port = NonZeroU16::new(external_port).ok_or(Failure::InvalidResponse(
-        InvalidResponseKind::ZeroExternalPort,
-    ))?;
+    let external_port =
+        NonZeroU16::new(external_port).ok_or(InvalidResponseKind::ZeroExternalPort)?;
 
     Ok(PortMapping {
         gateway: base.gateway,
@@ -471,9 +470,7 @@ pub async fn try_drop_mapping(
 
     // Check that the response is correct for a deletion request.
     if lifetime_seconds != 0 {
-        return Err(Failure::InvalidResponse(
-            InvalidResponseKind::InvalidDeletionResponse { lifetime_seconds },
-        ));
+        return Err(InvalidResponseKind::InvalidDeletionResponse { lifetime_seconds }.into());
     }
 
     Ok(())
@@ -603,10 +600,11 @@ pub async fn peer_mapping(
 
     // Ensure we can read the rest of the peer response.
     if n < 80 {
-        return Err(Failure::InvalidResponse(InvalidResponseKind::TooFewBytes {
+        return Err(InvalidResponseKind::TooFewBytes {
             received: n,
             expected: 80,
-        }));
+        }
+        .into());
     }
 
     // Validate the nonce.
@@ -620,16 +618,15 @@ pub async fn peer_mapping(
     // Validate the internal port.
     let internal_port = base.internal_port;
     validate_port(&mut recv_bb, internal_port.get()).map_err(|r| {
-        Failure::InvalidResponse(InvalidResponseKind::IncorrectInternalPort {
+        InvalidResponseKind::IncorrectInternalPort {
             received: r,
             expected: internal_port.get(),
-        })
+        }
     })?;
 
     // The external port assigned to our mapping. The server may not use the requested port, if present.
-    let external_port = NonZeroU16::new(recv_bb.get_u16()).ok_or(Failure::InvalidResponse(
-        InvalidResponseKind::ZeroExternalPort,
-    ))?;
+    let external_port =
+        NonZeroU16::new(recv_bb.get_u16()).ok_or(InvalidResponseKind::ZeroExternalPort)?;
 
     // The external IP address assigned to our mapping.
     let external_ip = read_ip6_addr(&mut recv_bb);
@@ -641,10 +638,10 @@ pub async fn peer_mapping(
 
     // Validate the remote port.
     validate_port(&mut recv_bb, remote_port).map_err(|r| {
-        Failure::InvalidResponse(InvalidResponseKind::IncorrectRemotePort {
+        InvalidResponseKind::IncorrectRemotePort {
             received: r,
             expected: remote_port,
-        })
+        }
     })?;
 
     recv_bb.advance(2); // Reserved.
@@ -657,12 +654,11 @@ pub async fn peer_mapping(
         IpAddr::V6(response_remote_ip)
     };
     if response_remote_ip != remote_ip {
-        return Err(Failure::InvalidResponse(
-            InvalidResponseKind::IncorrectRemoteIp {
-                received: response_remote_ip,
-                expected: remote_ip,
-            },
-        ));
+        return Err(InvalidResponseKind::IncorrectRemoteIp {
+            received: response_remote_ip,
+            expected: remote_ip,
+        }
+        .into());
     }
 
     Ok(PeerMapping {
@@ -754,10 +750,11 @@ async fn port_mapping_internal(
 
     // Ensure we can read the rest of the map response.
     if n < 60 {
-        return Err(Failure::InvalidResponse(InvalidResponseKind::TooFewBytes {
+        return Err(InvalidResponseKind::TooFewBytes {
             received: n,
             expected: 60,
-        }));
+        }
+        .into());
     }
 
     // Validate the mapping response values.
@@ -776,10 +773,10 @@ async fn port_mapping_internal(
         0
     };
     validate_port(&mut bb, expected_internal_port).map_err(|r| {
-        Failure::InvalidResponse(InvalidResponseKind::IncorrectInternalPort {
+        InvalidResponseKind::IncorrectInternalPort {
             received: r,
             expected: expected_internal_port,
-        })
+        }
     })?;
 
     // The external port assigned to our mapping. The server may not use the suggested port, if present.
@@ -972,7 +969,7 @@ fn validate_base_response(
                 bb.get_u8()
                     .try_into()
                     .map_err(|e: num_enum::TryFromPrimitiveError<_>| {
-                        Failure::InvalidResponse(InvalidResponseKind::UnknownVersion(e.number))
+                        InvalidResponseKind::UnknownVersion(e.number)
                     })?;
             bb.advance(2); // Skip opcode and reserved bytes.
 
@@ -984,47 +981,42 @@ fn validate_base_response(
         }
 
         // The response is too short to be valid.
-        return Err(Failure::InvalidResponse(InvalidResponseKind::TooFewBytes {
+        return Err(InvalidResponseKind::TooFewBytes {
             received: n,
             expected: HEADER_SIZE,
-        }));
+        }
+        .into());
     }
 
     // PCP responses are always a multiple of 4 bytes, see <https://www.rfc-editor.org/rfc/rfc6887#section-8.3>, page 26.
     if !n.is_multiple_of(4) {
-        return Err(Failure::InvalidResponse(
-            InvalidResponseKind::ResponseNotMultipleOfFour(n),
-        ));
+        return Err(InvalidResponseKind::ResponseNotMultipleOfFour(n).into());
     }
 
     // Parse the PCP response header.
     let v = VersionCode::try_from(bb.get_u8())
-        .map_err(|e| Failure::InvalidResponse(InvalidResponseKind::UnknownVersion(e.number)))?;
+        .map_err(|e| InvalidResponseKind::UnknownVersion(e.number))?;
     if v != VersionCode::Pcp {
         return Err(Failure::UnsupportedVersion(v));
     }
 
     let r_opcode_octet = bb.get_u8();
     if r_opcode_octet & 0x80 == 0 {
-        return Err(Failure::InvalidResponse(
-            InvalidResponseKind::ResponseBitNotSet(r_opcode_octet),
-        ));
+        return Err(InvalidResponseKind::ResponseBitNotSet(r_opcode_octet).into());
     }
 
-    let op = response_to_opcode(r_opcode_octet).map_err(|e| {
-        Failure::InvalidResponse(InvalidResponseKind::InvalidOperationCode(e.number))
-    })?;
+    let op = response_to_opcode(r_opcode_octet)
+        .map_err(|e| InvalidResponseKind::InvalidOperationCode(e.number))?;
     if op != expected_op {
-        return Err(Failure::InvalidResponse(
-            InvalidResponseKind::IncorrectOpcode {
-                received: op,
-                expected: expected_op,
-            },
-        ));
+        return Err(InvalidResponseKind::IncorrectOpcode {
+            received: op,
+            expected: expected_op,
+        }
+        .into());
     }
     bb.advance(1); // Reserved.
     let result_code = ResultCode::try_from(bb.get_u8())
-        .map_err(|e| Failure::InvalidResponse(InvalidResponseKind::InvalidResultCode(e.number)))?;
+        .map_err(|e| InvalidResponseKind::InvalidResultCode(e.number))?;
 
     // On error, lifetime indicates the number of seconds until the error is expected to be resolved.
     // See <https://www.rfc-editor.org/rfc/rfc6887#section-8.3>, page 26.
@@ -1124,12 +1116,11 @@ fn validate_protocol(
 ) -> Result<(), Failure> {
     let response_protocol = bb.get_u8();
     if response_protocol != expected_protocol.map_or(0, protocol_to_byte) {
-        return Err(Failure::InvalidResponse(
-            InvalidResponseKind::IncorrectProtocol {
-                received: response_protocol,
-                expected: expected_protocol,
-            },
-        ));
+        return Err(InvalidResponseKind::IncorrectProtocol {
+            received: response_protocol,
+            expected: expected_protocol,
+        }
+        .into());
     }
     Ok(())
 }
@@ -1173,8 +1164,18 @@ impl PeerMapping {
             },
         )
         .await
+        .and_then(|m| {
+            // Validate that this is a successful removal.
+            if m.lifetime_seconds == 0 {
+                Ok(())
+            } else {
+                Err(InvalidResponseKind::InvalidDeletionResponse {
+                    lifetime_seconds: m.lifetime_seconds,
+                }
+                .into())
+            }
+        })
         .map_err(|e| (e, self))
-        .map(std::mem::drop)
     }
 
     #[must_use]

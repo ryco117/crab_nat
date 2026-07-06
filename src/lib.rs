@@ -11,8 +11,8 @@
 //!     use crab_nat::{InternetProtocol, PortMapping, PortMappingOptions};
 //!     // Attempt a port mapping request through PCP first and fallback to NAT-PMP.
 //!     let mapping = match PortMapping::new(
-//!         IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), /* Address of the PCP server, often a gateway or firewall */
-//!         IpAddr::V4(Ipv4Addr::new(192, 168, 1, 167)), /* Address of our client, as seen by the gateway. Only strictly necessary for PCP */
+//!         Ipv4Addr::new(192, 168, 1, 1).into(), /* Address of the PCP server, often a gateway or firewall */
+//!         Ipv4Addr::new(192, 168, 1, 167).into(), /* Address of our client, as seen by the gateway. Only strictly necessary for PCP */
 //!         InternetProtocol::Tcp, /* Protocol to map */
 //!         NonZeroU16::new(8080).unwrap(), /* Internal port, cannot be zero */
 //!         PortMappingOptions::default(), /* Optional configuration values, including suggested external port and lifetimes */
@@ -27,7 +27,7 @@
 //!
 //!     // Try to safely drop the mapping.
 //!     if let Err((e, m)) = mapping.try_drop().await {
-//!         eprintln!("Failed to drop mapping {}:{}->{}: {e:?}", m.gateway(), m.external_port(), m.internal_port());
+//!         eprintln!("Failed to drop mapping {:?}:{}->{}: {e:?}", m.gateway(), m.external_port(), m.internal_port());
 //!     } else {
 //!         println!("Successfully deleted the mapping...");
 //!     }
@@ -130,6 +130,16 @@ impl From<IpAddr> for GatewayAddress {
         }
     }
 }
+impl From<std::net::Ipv4Addr> for GatewayAddress {
+    fn from(ip: std::net::Ipv4Addr) -> Self {
+        GatewayAddress::IpV4(ip)
+    }
+}
+impl From<std::net::Ipv6Addr> for GatewayAddress {
+    fn from(ip: std::net::Ipv6Addr) -> Self {
+        GatewayAddress::IpV6(ip, None)
+    }
+}
 
 /// Configuration of the timing of UDP requests to the gateway.
 #[derive(Clone, Copy, Debug)]
@@ -180,6 +190,8 @@ pub struct PortMapping {
     expiration: std::time::Instant,
 
     /// The gateway epoch time when the port mapping was created.
+    /// The RFC recommends checking if this value ever decreases and assuming the gateway has rebooted if it does by a certain margin (<https://www.rfc-editor.org/info/rfc6886/#section-3.6>, <https://www.rfc-editor.org/info/rfc6887/#section-8.5>).
+    /// If the gateway has rebooted, all mappings on the gateway are lost and should be renewed.
     gateway_epoch_seconds: u32,
 
     /// The type of mapping protocol used, as well as any protocol specific parameters.
@@ -443,8 +455,10 @@ mod helpers {
                 .map_err(RequestSendError::Socket)
         }
 
-        // Use the specified initial timeout and double it on each successive failure.
-        let mut wait = timeout_config.initial_timeout;
+        // Use the specified initial timeout and double it on each successive failure, with optional fuzzing.
+        // NOTE: Technically, `fuzz_timeout` fuzzes [0.95-1.05] of the initial timeout in PCP, whereas the RFC recommends [0.9-1.1].
+        //       However, the approach used allows the types to stay as positive `Duration`s while meeting the max-timeout requirements.
+        let mut wait = fuzz_timeout(timeout_config.initial_timeout);
         let mut retries = 0;
         let max_retries = timeout_config.max_retries;
         loop {

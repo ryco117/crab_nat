@@ -125,7 +125,7 @@ pub enum Failure {
 
     /// The gateway did not give a valid response according to the NAT-PMP protocol.
     #[error("Invalid response: {0}")]
-    InvalidResponse(InvalidResponseKind),
+    InvalidResponse(#[from] InvalidResponseKind),
 
     /// The server does not support this version of the protocol.
     #[error("Server responded with code: Unsupported version: {0}")]
@@ -206,25 +206,21 @@ pub async fn external_address(
 
     // An `ExternalAddress` response is always expected to be 12 bytes.
     if n != ADDRESS_RESPONSE_SIZE {
-        return Err(Failure::InvalidResponse(
-            InvalidResponseKind::IncorrectByteCount(n),
-        ));
+        return Err(InvalidResponseKind::IncorrectByteCount(n).into());
     }
     let mut reader = &recv_buffer[..ADDRESS_RESPONSE_SIZE];
 
-    // Read and verify the version and operation bytes.
+    // Read and verify the version and operation code.
     let v = VersionCode::try_from(reader.get_u8())
-        .map_err(|e| Failure::InvalidResponse(InvalidResponseKind::UnknownVersion(e.number)))?;
+        .map_err(|e| InvalidResponseKind::UnknownVersion(e.number))?;
     let op = response_to_opcode(reader.get_u8())?;
     if op != OperationCode::ExternalAddress {
-        return Err(Failure::InvalidResponse(
-            InvalidResponseKind::IncorrectOpcode(op),
-        ));
+        return Err(InvalidResponseKind::IncorrectOpcode(op).into());
     }
 
     // Read and verify the result code.
     let result_code = ResultCode::try_from(reader.get_u16())
-        .map_err(|e| Failure::InvalidResponse(InvalidResponseKind::InvalidResultCode(e.number)))?;
+        .map_err(|e| InvalidResponseKind::InvalidResultCode(e.number))?;
     let _gateway_epoch_seconds = reader.get_u32();
 
     // Map error result codes to a failure, otherwise continue.
@@ -232,9 +228,7 @@ pub async fn external_address(
 
     // Since the `ResultCode` is `Success`, the version should always be `NatPmp`.
     if v != VersionCode::NatPmp {
-        return Err(Failure::InvalidResponse(
-            InvalidResponseKind::VersionMismatch(v),
-        ));
+        return Err(InvalidResponseKind::VersionMismatch(v).into());
     }
 
     // The response was a success, read the remaining 4 bytes as the external IP.
@@ -265,9 +259,8 @@ pub async fn port_mapping(
         lifetime_seconds,
         timeout_config,
     } = port_mapping_internal(gateway, protocol, internal_port.get(), mapping_options).await?;
-    let external_port = NonZeroU16::new(external_port).ok_or(Failure::InvalidResponse(
-        InvalidResponseKind::ZeroExternalPort,
-    ))?;
+    let external_port =
+        NonZeroU16::new(external_port).ok_or(InvalidResponseKind::ZeroExternalPort)?;
 
     Ok(PortMapping {
         gateway,
@@ -312,12 +305,11 @@ pub async fn try_drop_mapping(
 
     // Check that the response is correct for a deletion request.
     if external_port != 0 || lifetime_seconds != 0 {
-        return Err(Failure::InvalidResponse(
-            InvalidResponseKind::InvalidDeletionResponse {
-                external_port,
-                lifetime_seconds,
-            },
-        ));
+        return Err(InvalidResponseKind::InvalidDeletionResponse {
+            external_port,
+            lifetime_seconds,
+        }
+        .into());
     }
 
     Ok(())
@@ -399,25 +391,21 @@ async fn port_mapping_internal(
 
     // A port mapping response is always expected to be 16 bytes.
     if n != RESPONSE_DATAGRAM_SIZE {
-        return Err(Failure::InvalidResponse(
-            InvalidResponseKind::IncorrectByteCount(n),
-        ));
+        return Err(InvalidResponseKind::IncorrectByteCount(n).into());
     }
     let mut recv = &recv_buffer[..RESPONSE_DATAGRAM_SIZE];
 
-    // Read and verify the version and operation bytes.
+    // Read and verify the version and operation code.
     let v = VersionCode::try_from(recv.get_u8())
-        .map_err(|e| Failure::InvalidResponse(InvalidResponseKind::UnknownVersion(e.number)))?;
+        .map_err(|e| InvalidResponseKind::UnknownVersion(e.number))?;
     let op = response_to_opcode(recv.get_u8())?;
     if op != req_op {
-        return Err(Failure::InvalidResponse(
-            InvalidResponseKind::IncorrectOpcode(op),
-        ));
+        return Err(InvalidResponseKind::IncorrectOpcode(op).into());
     }
 
     // Read and verify the result code.
     let result_code = ResultCode::try_from(recv.get_u16())
-        .map_err(|e| Failure::InvalidResponse(InvalidResponseKind::InvalidResultCode(e.number)))?;
+        .map_err(|e| InvalidResponseKind::InvalidResultCode(e.number))?;
     let gateway_epoch_seconds = recv.get_u32();
 
     // Map error result codes to a failure, otherwise continue.
@@ -425,20 +413,17 @@ async fn port_mapping_internal(
 
     // Since the `ResultCode` is `Success`, the version should always be `NatPmp`.
     if v != VersionCode::NatPmp {
-        return Err(Failure::InvalidResponse(
-            InvalidResponseKind::VersionMismatch(v),
-        ));
+        return Err(InvalidResponseKind::VersionMismatch(v).into());
     }
 
     // Validate that the response corresponds to the requested internal port.
     let response_internal_port = recv.get_u16();
     if response_internal_port != internal_port {
-        return Err(Failure::InvalidResponse(
-            InvalidResponseKind::IncorrectInternalPort {
-                received: response_internal_port,
-                expected: internal_port,
-            },
-        ));
+        return Err(InvalidResponseKind::IncorrectInternalPort {
+            received: response_internal_port,
+            expected: internal_port,
+        }
+        .into());
     }
 
     // The response was a success, read the mapping information.
@@ -459,12 +444,10 @@ async fn port_mapping_internal(
 /// Returns a `Failure::InvalidResponse` if the R bit is not set or the masked opcode is unrecognized.
 fn response_to_opcode(op: u8) -> Result<OperationCode, Failure> {
     if op & 0x80 == 0 {
-        return Err(Failure::InvalidResponse(
-            InvalidResponseKind::ResponseBitNotSet(op),
-        ));
+        return Err(InvalidResponseKind::ResponseBitNotSet(op).into());
     }
     OperationCode::try_from(op & 0x7F)
-        .map_err(|e| Failure::InvalidResponse(InvalidResponseKind::InvalidOperationCode(e.number)))
+        .map_err(|e| InvalidResponseKind::InvalidOperationCode(e.number).into())
 }
 
 #[cfg(test)]

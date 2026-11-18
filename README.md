@@ -10,7 +10,7 @@ If there isn't a preference on which port mapping protocol is used or what the e
 // Attempt a port mapping request through PCP first and fallback to NAT-PMP.
 let mapping = match crab_nat::PortMapping::new(
     gateway, /* Address of the PCP server, often a gateway or firewall */
-    local_address, /* Address of our client, as seen by the gateway. Only used by PCP */
+    local_address, /* Local address of our client, which PCP requests are sent from. Only used by PCP */
     crab_nat::InternetProtocol::Tcp, /* Protocol to map */
     std::num::NonZeroU16::new(8080).unwrap(), /* Internal port, cannot be zero */
     crab_nat::PortMappingOptions::default(), /* Optional configuration values, including suggested external port and lifetimes */

@@ -183,7 +183,7 @@ pub async fn external_address(
     const ADDRESS_RESPONSE_SIZE: usize = 12;
 
     // Create a new UDP socket and connect to the gateway.
-    let socket = helpers::new_socket(gateway)
+    let socket = helpers::new_socket(gateway, None)
         .await
         .map_err(Failure::Socket)?;
 
@@ -345,7 +345,7 @@ async fn port_mapping_internal(
         "Internal port can only be `0` for a valid 'delete all' request."
     );
 
-    let socket = helpers::new_socket(gateway)
+    let socket = helpers::new_socket(gateway, None)
         .await
         .map_err(Failure::Socket)?;
 

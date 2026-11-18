@@ -250,6 +250,8 @@ impl From<RequestSendError> for Failure {
 #[derive(Clone, Copy)]
 pub struct BaseMapRequest {
     pub gateway: GatewayAddress,
+    /// Local address of our client. Requests are sent from it and carry it in the header,
+    /// see <https://www.rfc-editor.org/rfc/rfc6887#section-7.1>.
     pub client: IpAddr,
     pub protocol: InternetProtocol,
     pub internal_port: NonZeroU16,
@@ -537,7 +539,7 @@ pub async fn peer_mapping(
         session_nonce.unwrap_or_else(|| [rand::random(), rand::random(), rand::random()]);
 
     // Create a new UDP socket to communicate with the gateway.
-    let socket = helpers::new_socket(base.gateway)
+    let socket = helpers::new_socket(base.gateway, Some(base.client))
         .await
         .map_err(Failure::Socket)?;
 
@@ -833,7 +835,7 @@ async fn try_send_map_request(
     recv_buffer: &mut [u8; MAX_DATAGRAM_SIZE],
 ) -> Result<PcpResponse<'_>, Failure> {
     // Create a new UDP socket to communicate with the gateway.
-    let socket = helpers::new_socket(gateway)
+    let socket = helpers::new_socket(gateway, Some(client))
         .await
         .map_err(Failure::Socket)?;
 

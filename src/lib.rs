@@ -12,7 +12,7 @@
 //!     // Attempt a port mapping request through PCP first and fallback to NAT-PMP.
 //!     let mapping = match PortMapping::new(
 //!         Ipv4Addr::new(192, 168, 1, 1).into(), /* Address of the PCP server, often a gateway or firewall */
-//!         Ipv4Addr::new(192, 168, 1, 167).into(), /* Address of our client, as seen by the gateway. Only strictly necessary for PCP */
+//!         Ipv4Addr::new(192, 168, 1, 167).into(), /* Local address of our client, which PCP requests are sent from. Only strictly necessary for PCP */
 //!         InternetProtocol::Tcp, /* Protocol to map */
 //!         NonZeroU16::new(8080).unwrap(), /* Internal port, cannot be zero */
 //!         PortMappingOptions::default(), /* Optional configuration values, including suggested external port and lifetimes */
@@ -375,21 +375,32 @@ impl PortMapping {
 /// Private module for shared helper functions within the library.
 mod helpers {
     use crate::{GatewayAddress, TimeoutConfig};
-    use std::time::Duration;
+    use std::{net::IpAddr, time::Duration};
     use tokio::net::UdpSocket;
 
     /// Create a new UDP socket and "connect" it to the gateway socket address for NAT-PMP or PCP.
+    /// `source` is the local address to send from; the OS chooses one when it is `None` or of
+    /// the other IP family.
     /// # Errors
     /// Will return an error if we fail to bind to a local UDP socket or connect to the gateway address.
     pub async fn new_socket(
         gateway: GatewayAddress,
+        source: Option<IpAddr>,
     ) -> Result<tokio::net::UdpSocket, std::io::Error> {
         use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
         // Create a new UDP with an IP protocol matching that of the gateway address.
-        let socket = tokio::net::UdpSocket::bind(match &gateway {
-            GatewayAddress::IpV4(_) => SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)),
-            GatewayAddress::IpV6(_, _) => {
+        let socket = tokio::net::UdpSocket::bind(match (gateway, source) {
+            (GatewayAddress::IpV4(_), Some(IpAddr::V4(source))) => {
+                SocketAddr::V4(SocketAddrV4::new(source, 0))
+            }
+            (GatewayAddress::IpV6(_, scope_id), Some(IpAddr::V6(source))) => {
+                SocketAddr::V6(SocketAddrV6::new(source, 0, 0, scope_id.unwrap_or(0)))
+            }
+            (GatewayAddress::IpV4(_), _) => {
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))
+            }
+            (GatewayAddress::IpV6(_, _), _) => {
                 SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0))
             }
         })

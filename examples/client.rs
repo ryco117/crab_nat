@@ -17,7 +17,7 @@ struct Cli {
     #[arg(short, long)]
     gateway: Option<String>,
 
-    /// The local address the gateway will expect to see our address as. If empty, will attempt to determine a default network address.
+    /// The local address PCP requests are sent from. If empty, will attempt to determine a default network address.
     #[arg(short, long)]
     local_address: Option<String>,
 

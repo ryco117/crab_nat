@@ -339,3 +339,53 @@ fn test_write_base_request_ipv4() {
     // Suggested external IP should be IPv4-mapped unspecified when None
     assert_eq!(suggested_ip, Ipv4Addr::UNSPECIFIED.to_ipv6_mapped());
 }
+
+/// A server rejects a request whose source differs from the client address in its header,
+/// see <https://www.rfc-editor.org/rfc/rfc6887#section-8.2>.
+/// Requires Linux's implicit 127.0.0.0/8 loopback aliases.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn test_request_is_sent_from_client_address() {
+    let gateway = Ipv4Addr::new(127, 0, 0, 3);
+    let client = Ipv4Addr::new(127, 0, 0, 4);
+    let socket = tokio::net::UdpSocket::bind((gateway, crate::GATEWAY_PORT))
+        .await
+        .unwrap();
+    let server = async {
+        let mut buf = [0; MAX_DATAGRAM_SIZE];
+        let (n, peer) = tokio::time::timeout(Duration::from_secs(5), socket.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&buf[8..24], &client.to_ipv6_mapped().octets());
+        assert_eq!(
+            peer.ip(),
+            IpAddr::V4(client),
+            "request sent from another address"
+        );
+        buf[1] = 0x81;
+        buf[8..24].fill(0);
+        socket.send_to(&buf[..n], peer).await.unwrap();
+    };
+    let mapping = port_mapping(
+        BaseMapRequest::new(
+            gateway.into(),
+            client.into(),
+            InternetProtocol::Tcp,
+            NonZeroU16::new(8080).unwrap(),
+        ),
+        None,
+        None,
+        PortMappingOptions {
+            external_port: NonZeroU16::new(8080),
+            timeout_config: Some(TimeoutConfig {
+                initial_timeout: Duration::from_secs(2),
+                max_retries: 0,
+                max_retry_timeout: None,
+            }),
+            ..Default::default()
+        },
+    );
+    let (_, result) = tokio::join!(server, mapping);
+    assert_eq!(result.unwrap().external_port().get(), 8080);
+}
